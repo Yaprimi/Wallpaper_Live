@@ -1,0 +1,17 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+	<PropertyGroup>
+		<OutputType>WinExe</OutputType>
+		<!-- Використовуємо версію з підтримкою Windows 10 SDK для доступу до MediaManager -->
+		<TargetFramework>net9.0-windows10.0.19041.0</TargetFramework>
+		<Nullable>enable</Nullable>
+		<UseWPF>true</UseWPF>
+		<ImplicitUsings>enable</ImplicitUsings>
+	</PropertyGroup>
+
+	<ItemGroup>
+		<!-- Бібліотека для пошуку відео та отримання посилань -->
+		<PackageReference Include="YoutubeExplode" Version="6.5.6" />
+	</ItemGroup>
+
+</Project>

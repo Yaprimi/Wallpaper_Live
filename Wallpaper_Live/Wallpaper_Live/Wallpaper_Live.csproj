@@ -4,13 +4,22 @@
 		<OutputType>WinExe</OutputType>
 		<!-- Використовуємо версію з підтримкою Windows 10 SDK для доступу до MediaManager -->
 		<TargetFramework>net9.0-windows10.0.19041.0</TargetFramework>
+		<RootNamespace>Wallpaper_Live</RootNamespace>
 		<Nullable>enable</Nullable>
-		<UseWPF>true</UseWPF>
 		<ImplicitUsings>enable</ImplicitUsings>
+		<UseWPF>true</UseWPF>
+		
+		<Platforms>x64</Platforms>
+		<RuntimeIdentifier>win-x64</RuntimeIdentifier>
+		<RuntimeIdentifiers>win-x64</RuntimeIdentifiers>
+		<UseRidGraph>true</UseRidGraph>
+		<StartupObject>Wallpaper_Live.App</StartupObject>
 	</PropertyGroup>
 
 	<ItemGroup>
-		<!-- Бібліотека для пошуку відео та отримання посилань -->
+		<PackageReference Include="LibVLCSharp" Version="3.9.4" />
+		<PackageReference Include="LibVLCSharp.WPF" Version="3.9.4" />
+		<PackageReference Include="VideoLAN.LibVLC.Windows" Version="3.0.21" />
 		<PackageReference Include="YoutubeExplode" Version="6.5.6" />
 	</ItemGroup>
 

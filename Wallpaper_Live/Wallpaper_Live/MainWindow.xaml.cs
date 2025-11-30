@@ -35,8 +35,15 @@ namespace WallpaperMusicPlayer
         private CancellationTokenSource? _searchCts;
 
         // Кеш
-        private readonly Dictionary<string, string> _videoCache = new();
-        // Тепер тут зберігається: "Назва пісні" -> "VideoID" (а не URL)
+        private struct CachedVideo
+        {
+            public string VideoId;
+            public string StreamUrl;
+            public DateTime ExpiryTime;
+        }
+
+        // "Назва пісні" -> Дані про відео
+        private readonly Dictionary<string, CachedVideo> _smartCache = new();
 
         // Таймери та час
         private readonly DispatcherTimer _monitorTimer = new();
@@ -178,71 +185,74 @@ namespace WallpaperMusicPlayer
 
             try
             {
-                // 1. Пошук активної сесії
+                // 1. Отримуємо активну сесію
                 var session = GetRelevantSession(_mediaManager);
 
-                // Якщо сесій немає взагалі
                 if (session == null)
                 {
+                    // Якщо музики немає взагалі - ставимо паузу
                     if (_vlcPlayer.IsPlaying)
                     {
-                        Log("[MONITOR] No active session. Pausing...", "warning");
+                        Log("[MONITOR] No active session -> Pausing Video", "warning");
                         _vlcPlayer.Pause();
                     }
                     return;
                 }
 
-                // 2. Перевірка статусу (Play/Pause)
+                // 2. Перевіряємо статус (Грає чи Пауза?)
                 var playbackInfo = session.GetPlaybackInfo();
                 bool isMusicPlaying = playbackInfo.PlaybackStatus == GlobalSystemMediaTransportControlsSessionPlaybackStatus.Playing;
 
-                // Логування зміни статусу (для діагностики)
+                // Логуємо зміну статусу (тільки якщо він змінився) — як у ВЕРХНЬОМУ коді
                 if (isMusicPlaying != _wasPlaying)
                 {
-                    string appName = session.SourceAppUserModelId;
-                    Log($"[STATUS] {appName} changed to: {(isMusicPlaying ? "PLAYING" : "PAUSED")}", isMusicPlaying ? "success" : "warning");
+                    Log($"[STATUS CHANGE] Music is now: {(isMusicPlaying ? "PLAYING" : "PAUSED/STOPPED")}", isMusicPlaying ? "success" : "warning");
                     _wasPlaying = isMusicPlaying;
                 }
 
-                // --- ЛОГІКА ПАУЗИ (Повернуто логування з верхнього коду + скидання математики з нижнього) ---
+                // --- ЛОГІКА ПАУЗИ (ВЗЯТО З ВЕРХНЬОГО КОДУ) ---
                 if (!isMusicPlaying)
                 {
+                    // Якщо музика стоїть, а відео грає -> ПАУЗА
                     if (_vlcPlayer.IsPlaying)
                     {
                         _vlcPlayer.Pause();
-                        Log("[MONITOR] Sync Pause executed", "info"); // Повернуто лог
+                        Log("[MONITOR] Sync Pause executed", "info");
                     }
 
-                    // На паузі екстраполяцію не робимо, показуємо статичний час
+                    // Оновлюємо таймер на екрані (статичний час)
                     var timelinePaused = session.GetTimelineProperties();
-                    TimeSpan pausedAudioTime = timelinePaused?.Position ?? TimeSpan.Zero;
-                    UpdateTimingDisplay(pausedAudioTime, TimeSpan.FromMilliseconds(_vlcPlayer.Time), false);
+                    TimeSpan pausedTime = timelinePaused?.Position ?? TimeSpan.Zero;
+                    UpdateTimingDisplay(pausedTime, TimeSpan.FromMilliseconds(_vlcPlayer.Time), false);
 
-                    // Скидаємо екстраполятор VLC, щоб при відновленні не було стрибка (логіка нижнього коду)
+                    // Скидаємо екстраполятор VLC (з нижнього), щоб при відновленні не було стрибка
                     _lastVlcRawTime = -1;
-                    return;
+                    return; // Виходимо
                 }
 
-                // --- ЛОГІКА ВІДТВОРЕННЯ ---
+                // --- ЛОГІКА ВІДТВОРЕННЯ (ВЗЯТО З ВЕРХНЬОГО КОДУ) ---
 
-                // Якщо музика грає, а відео стоїть -> Play
+                // 1. Якщо відео завантажено, але стоїть на паузі -> PLAY
                 if (_isVideoLoaded && !_vlcPlayer.IsPlaying)
                 {
-                    Log("[MONITOR] Resuming Video", "info");
+                    Log("[MONITOR] Resuming Video...", "info");
                     _vlcPlayer.Play();
                     _lastVlcRawTime = -1; // Скидання для чистого старту
                 }
 
-                // 3. Перевірка зміни треку
+                // 2. Отримання інфо про трек
                 var info = await session.TryGetMediaPropertiesAsync();
                 string artist = info?.Artist ?? "";
                 string title = info?.Title ?? "";
                 string currentSong = (!string.IsNullOrEmpty(artist) || !string.IsNullOrEmpty(title))
                                      ? $"{artist} - {title}" : "Unknown";
 
+                // Якщо пісня змінилася
                 if (currentSong != "Unknown" && currentSong != _lastSong)
                 {
                     _lastSong = currentSong;
+
+                    // Скидаємо прапорці
                     _isVideoLoaded = false;
                     _isLoopingVideo = false;
                     _lastVlcRawTime = -1; // Скидаємо математику відео
@@ -250,42 +260,40 @@ namespace WallpaperMusicPlayer
                     _searchCts?.Cancel();
                     _searchCts = new CancellationTokenSource();
 
-                    Log($"♪ Track: {currentSong}", "info");
+                    Log($"♪ Track Changed: {currentSong}", "info");
+
+                    // Запускаємо пошук нового відео
                     _ = ProcessSongAsync(currentSong, _searchCts.Token);
                 }
 
                 // =========================================================
-                // 4. МАТЕМАТИКА ЧАСУ (ПОДВІЙНА ЕКСТРАПОЛЯЦІЯ - З НИЖНЬОГО КОДУ)
+                // 4. МАТЕМАТИКА ЧАСУ (ТОЧНА ЕКСТРАПОЛЯЦІЯ З НИЖНЬОГО КОДУ)
                 // =========================================================
 
-                // А) Розрахунок плавного часу АУДІО (Windows)
+                // А) Розрахунок плавного часу АУДІО
                 var timeline = session.GetTimelineProperties();
                 TimeSpan liveAudioTime = TimeSpan.Zero;
 
                 if (timeline != null)
                 {
-                    // Формула: Час на момент оновлення + Скільки пройшло з того моменту
                     liveAudioTime = timeline.Position + (DateTimeOffset.Now - timeline.LastUpdatedTime);
                 }
 
-                // Б) Розрахунок плавного часу ВІДЕО (VLC)
-                long currentRawVlcTime = _vlcPlayer.Time; // "Сирий" час (оновлюється ривками)
+                // Б) Розрахунок плавного часу ВІДЕО
+                long currentRawVlcTime = _vlcPlayer.Time;
                 TimeSpan smoothVlcTime;
 
                 if (currentRawVlcTime != _lastVlcRawTime && currentRawVlcTime != -1)
                 {
-                    // VLC оновив дані! Синхронізуємо базу.
                     _lastVlcRawTime = currentRawVlcTime;
                     _lastVlcUpdateTime = DateTime.Now;
                     smoothVlcTime = TimeSpan.FromMilliseconds(currentRawVlcTime);
                 }
                 else
                 {
-                    // VLC ще не оновив дані. Екстраполюємо самі.
                     if (_lastVlcRawTime != -1 && _vlcPlayer.IsPlaying)
                     {
                         double msPassed = (DateTime.Now - _lastVlcUpdateTime).TotalMilliseconds;
-                        // Враховуємо поточну швидкість відтворення (Rate)!
                         double extrapolatedMs = _lastVlcRawTime + (msPassed * _vlcPlayer.Rate);
                         smoothVlcTime = TimeSpan.FromMilliseconds(extrapolatedMs);
                     }
@@ -295,26 +303,19 @@ namespace WallpaperMusicPlayer
                     }
                 }
 
-                // 5. Оновлення UI та Синхронізація
+                // 5. Оновлення UI
                 UpdateTimingDisplay(liveAudioTime, smoothVlcTime, true);
 
+                // Синхронізуємо швидкість (якщо це не короткий луп)
+                // ТУТ БЕЗ ТАЙМЕРА 1.5с — ПРАЦЮЄ КОЖЕН ТІК (ДЛЯ ТОЧНОСТІ 0.01)
                 if (_isVideoLoaded && !_isLoopingVideo)
                 {
-                    // --- ЛОГІКА ПЕРЕМОТКИ (SYNC) ПОВЕРНУТА З ВЕРХНЬОГО КОДУ ---
-                    // Робимо перевірку рідше (раз на 1.5 сек), щоб не навантажувати CPU і не смикати плеєр
-                    if ((DateTime.Now - _lastSyncTime).TotalSeconds > 1.5)
-                    {
-                        _lastSyncTime = DateTime.Now;
-
-                        // Передаємо ПЛАВНИЙ час (smoothVlcTime) з нижнього коду, 
-                        // але всередині таймера з верхнього коду.
-                        SyncVideoState(liveAudioTime, smoothVlcTime);
-                    }
+                    SyncVideoState(liveAudioTime, smoothVlcTime);
                 }
             }
             catch (Exception ex)
             {
-                // Ігноруємо помилки доступу до COM-об'єктів при перемиканні треків
+                // Ігноруємо помилки
             }
         }
 
@@ -413,53 +414,76 @@ namespace WallpaperMusicPlayer
                 string videoId = "";
                 string streamUrl = "";
 
-                // --- ЕТАП 1: ПОШУК ID ---
-                if (_videoCache.TryGetValue(query, out var cachedId))
+                // --- ЕТАП 1: РОЗУМНИЙ КЕШ (Миттєвий старт для повторів) ---
+                if (_smartCache.TryGetValue(query, out var cachedData))
                 {
-                    videoId = cachedId;
-                    Log($"[DEBUG] Cache Hit: {videoId}", "success");
+                    // Посилання YouTube живуть близько 6 годин. Перевіряємо, чи не протухло воно.
+                    if (DateTime.Now < cachedData.ExpiryTime)
+                    {
+                        Log($"[CACHE] Fast load: {cachedData.VideoId}", "success");
+                        PlayVideo(cachedData.StreamUrl);
+                        return; // Виходимо, бо ми вже запустили відео
+                    }
+                    else
+                    {
+                        // Посилання застаріло, але ID відео ми пам'ятаємо
+                        videoId = cachedData.VideoId;
+                    }
                 }
-                else
+
+                // --- ЕТАП 2: ПОШУК ID (Якщо його немає) ---
+                if (string.IsNullOrEmpty(videoId))
                 {
                     var searchResults = await _youtube.Search.GetVideosAsync(query, token).CollectAsync(1);
                     if (searchResults.Count > 0)
                     {
                         videoId = searchResults[0].Id.Value;
-                        if (_videoCache.Count > 100) _videoCache.Remove(_videoCache.Keys.First());
-                        _videoCache[query] = videoId;
                     }
                 }
 
-                if (token.IsCancellationRequested) return;
-                if (string.IsNullOrEmpty(videoId)) return;
+                if (token.IsCancellationRequested || string.IsNullOrEmpty(videoId)) return;
 
-                // --- ЕТАП 2: ОТРИМАННЯ ПОСИЛАННЯ ---
+                // --- ЕТАП 3: ОТРИМАННЯ ПОСИЛАННЯ ---
                 try
                 {
                     var manifest = await _youtube.Videos.Streams.GetManifestAsync(videoId, token);
+
+                    // ОПТИМІЗАЦІЯ: Беремо потік, який швидше вантажиться (MaxHeight 1080 - це компроміс).
+                    // Muxed (відео+аудіо в одному) часто стартує швидше, ніж VideoOnly, бо VLC не треба зводити два потоки,
+                    // але ми використовуємо VideoOnly, щоб економити трафік (бо звук нам не треба).
                     var videoStream = manifest.GetVideoOnlyStreams()
                         .Where(s => s.Container == Container.Mp4 && s.VideoQuality.MaxHeight <= 1080)
-                        .GetWithHighestVideoQuality()
-                        ?? manifest.GetVideoOnlyStreams().GetWithHighestVideoQuality()
-                        ?? manifest.GetMuxedStreams().GetWithHighestVideoQuality();
+                        .GetWithHighestVideoQuality();
 
-                    if (videoStream != null) streamUrl = videoStream.Url;
+                    if (videoStream != null)
+                    {
+                        streamUrl = videoStream.Url;
+
+                        // Зберігаємо в кеш на 5 годин (з запасом, бо живуть 6)
+                        _smartCache[query] = new CachedVideo
+                        {
+                            VideoId = videoId,
+                            StreamUrl = streamUrl,
+                            ExpiryTime = DateTime.Now.AddHours(5)
+                        };
+
+                        // Чистка кешу, якщо занадто великий
+                        if (_smartCache.Count > 100) _smartCache.Remove(_smartCache.Keys.First());
+                    }
                 }
                 catch (Exception ex)
                 {
                     Log($"[ERROR] Manifest: {ex.Message}", "error");
-                    _videoCache.Remove(query);
+                    _smartCache.Remove(query);
                     return;
                 }
 
                 if (token.IsCancellationRequested) return;
 
-                // --- ЕТАП 3: ЗАПУСК (ВИПРАВЛЕНО) ---
+                // --- ЕТАП 4: ЗАПУСК ---
                 if (!string.IsNullOrEmpty(streamUrl))
                 {
-                    // ВАЖЛИВО: Ми НЕ використовуємо Dispatcher.Invoke тут.
-                    // PlayVideo запускається у фоновому потоці (Task), щоб не блокувати UI.
-                    Log("[DEBUG] Calling PlayVideo from Background Thread...", "info");
+                    Log("[DEBUG] Starting playback...", "info");
                     PlayVideo(streamUrl);
                 }
             }
@@ -474,29 +498,30 @@ namespace WallpaperMusicPlayer
         {
             try
             {
-                // Цей код виконується у фоновому потоці!
                 _isVideoLoaded = false;
                 _isLoopingVideo = false;
 
-                // Створюємо медіа
                 var media = new LibVLCSharp.Shared.Media(_libVLC, new Uri(url));
 
-                // Опції для стабільності
-                // :avcodec-hw=any дозволяє VLC самому вирішити, що безпечно. 
-                // d3d11va може конфліктувати з WPF Surface.
-                media.AddOption(":avcodec-hw=any");
+                // --- ОПТИМІЗАЦІЯ ШВИДКОДІЇ VLC ---
+
+                // 1. Зменшуємо буфер мережі з 1500 до 300-500 мс.
+                // Це миттєво зменшує час "чорного екрану" на 1 секунду.
+                // Якщо інтернет поганий і будуть ривки, можна підняти до 800.
+                media.AddOption(":network-caching=300");
+
+                // 2. Вимикаємо синхронізацію годинника для потоку. 
+                // Це дозволяє відео стартувати, не чекаючи ідеального таймінгу (ми все одно рівняємо його самі).
+                media.AddOption(":clock-jitter=0");
+                media.AddOption(":clock-synchro=0");
+
+                // 3. Інші налаштування
+                media.AddOption(":avcodec-hw=any"); // Апаратне прискорення
                 media.AddOption(":input-repeat=65535");
-                media.AddOption(":no-audio");
+                media.AddOption(":no-audio"); // Точно не качаємо аудіо
 
-                // Збільшуємо кеш мережі, щоб уникнути зависань на старті
-                media.AddOption(":network-caching=1500");
-
-                Log("[VLC] Media created. Playing...", "info");
-
-                // Цей метод потокобезпечний у LibVLCSharp
+                Log("[VLC] Fast Play triggered...", "info");
                 _vlcPlayer.Play(media);
-
-                // НЕ викликаємо Dispose для media тут, нехай GC розбереться або VLC відпустить його сам
             }
             catch (Exception ex)
             {

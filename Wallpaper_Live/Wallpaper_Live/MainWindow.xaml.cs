@@ -204,17 +204,21 @@ namespace WallpaperMusicPlayer
                     _wasPlaying = isMusicPlaying;
                 }
 
-                // --- ЛОГІКА ПАУЗИ ---
+                // --- ЛОГІКА ПАУЗИ (Повернуто логування з верхнього коду + скидання математики з нижнього) ---
                 if (!isMusicPlaying)
                 {
-                    if (_vlcPlayer.IsPlaying) _vlcPlayer.Pause();
+                    if (_vlcPlayer.IsPlaying)
+                    {
+                        _vlcPlayer.Pause();
+                        Log("[MONITOR] Sync Pause executed", "info"); // Повернуто лог
+                    }
 
                     // На паузі екстраполяцію не робимо, показуємо статичний час
                     var timelinePaused = session.GetTimelineProperties();
                     TimeSpan pausedAudioTime = timelinePaused?.Position ?? TimeSpan.Zero;
                     UpdateTimingDisplay(pausedAudioTime, TimeSpan.FromMilliseconds(_vlcPlayer.Time), false);
 
-                    // Скидаємо екстраполятор VLC, щоб при відновленні не було стрибка
+                    // Скидаємо екстраполятор VLC, щоб при відновленні не було стрибка (логіка нижнього коду)
                     _lastVlcRawTime = -1;
                     return;
                 }
@@ -251,7 +255,7 @@ namespace WallpaperMusicPlayer
                 }
 
                 // =========================================================
-                // 4. МАТЕМАТИКА ЧАСУ (ПОДВІЙНА ЕКСТРАПОЛЯЦІЯ)
+                // 4. МАТЕМАТИКА ЧАСУ (ПОДВІЙНА ЕКСТРАПОЛЯЦІЯ - З НИЖНЬОГО КОДУ)
                 // =========================================================
 
                 // А) Розрахунок плавного часу АУДІО (Windows)
@@ -282,7 +286,6 @@ namespace WallpaperMusicPlayer
                     {
                         double msPassed = (DateTime.Now - _lastVlcUpdateTime).TotalMilliseconds;
                         // Враховуємо поточну швидкість відтворення (Rate)!
-                        // Якщо Rate = 1.05, час йде швидше.
                         double extrapolatedMs = _lastVlcRawTime + (msPassed * _vlcPlayer.Rate);
                         smoothVlcTime = TimeSpan.FromMilliseconds(extrapolatedMs);
                     }
@@ -297,8 +300,16 @@ namespace WallpaperMusicPlayer
 
                 if (_isVideoLoaded && !_isLoopingVideo)
                 {
-                    // Передаємо два ПЛАВНИХ значення
-                    SyncVideoState(liveAudioTime, smoothVlcTime);
+                    // --- ЛОГІКА ПЕРЕМОТКИ (SYNC) ПОВЕРНУТА З ВЕРХНЬОГО КОДУ ---
+                    // Робимо перевірку рідше (раз на 1.5 сек), щоб не навантажувати CPU і не смикати плеєр
+                    if ((DateTime.Now - _lastSyncTime).TotalSeconds > 1.5)
+                    {
+                        _lastSyncTime = DateTime.Now;
+
+                        // Передаємо ПЛАВНИЙ час (smoothVlcTime) з нижнього коду, 
+                        // але всередині таймера з верхнього коду.
+                        SyncVideoState(liveAudioTime, smoothVlcTime);
+                    }
                 }
             }
             catch (Exception ex)

@@ -1,16 +1,17 @@
-﻿using System.IO;
+﻿using LibVLCSharp.Shared;
+using System.Collections.Concurrent;
+using System.IO;
+using System.Threading;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Documents;
+using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Threading;
 using Windows.Media.Control;
 using YoutubeExplode;
 using YoutubeExplode.Common;
 using YoutubeExplode.Videos.Streams;
-using System.Collections.Concurrent;
-using System.Threading;
-using LibVLCSharp.Shared;
 
 namespace WallpaperMusicPlayer
 {
@@ -19,15 +20,19 @@ namespace WallpaperMusicPlayer
         private GlobalSystemMediaTransportControlsSessionManager? _mediaManager;
         private readonly YoutubeClient _youtube = new();
         private readonly string _logPath;
+
+        // --- Шляхи до локальних відео ---
+        private readonly string _idleVideoPath;    // Коли немає джерела (idle.mp4)
+        private readonly string _loadingVideoPath; // Коли вантажиться трек (loading.mp4)
+
         private DateTime _lastSeekTime = DateTime.MinValue;
         private long _lastVlcRawTime = -1;
         private DateTime _lastVlcUpdateTime = DateTime.MinValue;
-        private double _smoothedDiff = 0;
-        
+
         // Покращена синхронізація
-        private readonly Queue<double> _diffHistory = new Queue<double>(5); // Зменшено з 10 до 5
-        private double _displayDiff = 0; // Для відображення (згладжений)
-        private double _syncDiff = 0;    // Для синхронізації (швидкий)
+        private readonly Queue<double> _diffHistory = new Queue<double>(5);
+        private double _displayDiff = 0;
+        private double _syncDiff = 0;
 
         // VLC об'єкти
         private LibVLC _libVLC;
@@ -36,7 +41,7 @@ namespace WallpaperMusicPlayer
         // Стан
         private string _lastSong = "";
         private CancellationTokenSource? _searchCts;
-        
+
         // Плавні переходи
         private readonly DispatcherTimer _fadeTimer = new();
         private bool _isFading = false;
@@ -54,12 +59,13 @@ namespace WallpaperMusicPlayer
 
         // Таймери та час
         private readonly DispatcherTimer _monitorTimer = new();
-        private DateTime _lastSyncTime = DateTime.MinValue;
         private bool _isVideoLoaded = false;
         private bool _isLoopingVideo = false;
         private bool _wasPlaying = false;
 
-        // ВИПРАВЛЕННЯ: Додано локи для thread-safety
+        // --- Прапор локального лупу ---
+        private bool _isLocalLoopPlaying = false;
+
         private readonly object _vlcLock = new object();
         private readonly object _cacheLock = new object();
 
@@ -67,6 +73,11 @@ namespace WallpaperMusicPlayer
         {
             InitializeComponent();
             _logPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "debug_log.txt");
+
+            // Ініціалізація шляхів
+            string baseDir = AppDomain.CurrentDomain.BaseDirectory;
+            _idleVideoPath = Path.Combine(baseDir, "idle.mp4");       // Головна заглушка (офлайн)
+            _loadingVideoPath = Path.Combine(baseDir, "loading.mp4"); // Перехідна заглушка
 
             Core.Initialize();
             _libVLC = new LibVLC();
@@ -77,23 +88,40 @@ namespace WallpaperMusicPlayer
         private void Window_Loaded(object sender, RoutedEventArgs e)
         {
             _vlcPlayer.Volume = 0;
-
             _vlcPlayer.LengthChanged += VlcPlayer_LengthChanged;
             _vlcPlayer.EncounteredError += VlcPlayer_EncounteredError;
             _vlcPlayer.Playing += VlcPlayer_Playing;
-            _vlcPlayer.EndReached += VlcPlayer_EndReached; // ВИПРАВЛЕННЯ: Додано обробку кінця відео
+            _vlcPlayer.EndReached += VlcPlayer_EndReached;
 
             InitializeAsync();
+
+            // На старті запускаємо idle.mp4
+            PlayLocalLoop(_idleVideoPath, "Startup");
         }
 
-        // ВИПРАВЛЕННЯ: Додано обробку кінця відео для лупів
+        private void Window_KeyDown(object sender, KeyEventArgs e)
+        {
+            if (e.Key == Key.F12)
+            {
+                if (DebugPanel.Visibility == Visibility.Visible)
+                {
+                    DebugPanel.Visibility = Visibility.Collapsed;
+                }
+                else
+                {
+                    DebugPanel.Visibility = Visibility.Visible;
+                    // Прокручуємо лог вниз при відкритті
+                    LogOutput.ScrollToEnd();
+                }
+            }
+        }
+
         private void VlcPlayer_EndReached(object? sender, EventArgs e)
         {
             Dispatcher.InvokeAsync(() =>
             {
-                if (_isLoopingVideo)
+                if (_isLoopingVideo || _isLocalLoopPlaying)
                 {
-                    Log("[VLC] Loop restart", "info");
                     lock (_vlcLock)
                     {
                         _vlcPlayer.Stop();
@@ -110,15 +138,22 @@ namespace WallpaperMusicPlayer
                 _isVideoLoaded = true;
                 long durationMs = e.Length;
 
+                if (_isLocalLoopPlaying)
+                {
+                    _isLoopingVideo = true;
+                    Log($"[VLC] Type: Local Loop", "info");
+                    return;
+                }
+
                 if (durationMs < 60000)
                 {
                     _isLoopingVideo = true;
-                    Log($"[VLC] Type: Loop Wallpaper ({TimeSpan.FromMilliseconds(durationMs):mm\\:ss})", "info");
+                    Log($"[VLC] Type: Online Loop", "info");
                 }
                 else
                 {
                     _isLoopingVideo = false;
-                    Log($"[VLC] Type: Music Video ({TimeSpan.FromMilliseconds(durationMs):mm\\:ss})", "info");
+                    Log($"[VLC] Type: Music Video", "info");
                 }
             });
         }
@@ -128,8 +163,19 @@ namespace WallpaperMusicPlayer
             Dispatcher.InvokeAsync(() =>
             {
                 _isVideoLoaded = true;
-                Log("[VLC] Status: Playing", "success");
 
+                // Якщо це локальний луп, просто плавно показуємо
+                if (_isLocalLoopPlaying)
+                {
+                    Log("[VLC] Local Loop Playing", "success");
+                    StartFadeIn();
+                    return;
+                }
+
+                Log("[VLC] Status: Playing", "success");
+                StartFadeIn();
+
+                // Швидкий стрибок для онлайн відео
                 try
                 {
                     if (_mediaManager != null)
@@ -141,18 +187,15 @@ namespace WallpaperMusicPlayer
                             if (timeline != null)
                             {
                                 TimeSpan currentAudioTime = timeline.Position + (DateTimeOffset.Now - timeline.LastUpdatedTime);
-
-                                // ВИПРАВЛЕННЯ: Перевірка, що відео не закінчилось
                                 if (!_isLoopingVideo && currentAudioTime.TotalSeconds > 1 && _vlcPlayer.Length > 0)
                                 {
                                     long targetMs = (long)currentAudioTime.TotalMilliseconds;
                                     if (targetMs < _vlcPlayer.Length)
                                     {
-                                        Log($"[SYNC] QuickJump to {currentAudioTime:mm\\:ss}", "warning");
                                         lock (_vlcLock)
                                         {
                                             _vlcPlayer.Time = targetMs;
-                                            _lastVlcRawTime = targetMs; // ВИПРАВЛЕННЯ: Оновлюємо після seek
+                                            _lastVlcRawTime = targetMs;
                                             _lastVlcUpdateTime = DateTime.Now;
                                         }
                                     }
@@ -161,10 +204,7 @@ namespace WallpaperMusicPlayer
                         }
                     }
                 }
-                catch (Exception ex)
-                {
-                    Log($"[SYNC] QuickJump error: {ex.Message}", "warning");
-                }
+                catch { }
             });
         }
 
@@ -172,23 +212,25 @@ namespace WallpaperMusicPlayer
         {
             Dispatcher.InvokeAsync(() =>
             {
-                Log("[VLC] Critical Error occurred", "error");
+                Log("[VLC] Critical Error", "error");
                 _isVideoLoaded = false;
-                _lastVlcRawTime = -1; // ВИПРАВЛЕННЯ: Скидаємо стан
+
+                // Якщо помилка, пробуємо запустити loading.mp4 як fallback
+                if (!_isLocalLoopPlaying)
+                {
+                    PlayLocalLoop(_loadingVideoPath, "Error Recovery");
+                }
             });
         }
 
         private async void InitializeAsync()
         {
-            Log("Init Media API (VLC Mode)...", "info");
             try
             {
                 _mediaManager = await GlobalSystemMediaTransportControlsSessionManager.RequestAsync();
-
                 _monitorTimer.Interval = TimeSpan.FromMilliseconds(100);
                 _monitorTimer.Tick += MonitorLoop;
                 _monitorTimer.Start();
-
                 Log("Waiting for music...", "success");
             }
             catch (Exception ex)
@@ -197,25 +239,57 @@ namespace WallpaperMusicPlayer
             }
         }
 
+        // --- Універсальний метод для локальних файлів (idle або loading) ---
+        private void PlayLocalLoop(string path, string reason)
+        {
+            if (!File.Exists(path))
+            {
+                Log($"[LOCAL] File not found: {Path.GetFileName(path)}", "error");
+                return;
+            }
+
+            // Перевіряємо, чи ми вже не граємо цей файл, щоб не перезапускати дарма
+            // Але якщо це переключення між idle і loading, треба перезапустити
+
+            try
+            {
+                Log($"[LOCAL] Playing {Path.GetFileName(path)} ({reason})", "info");
+
+                _isLocalLoopPlaying = true;
+                _isLoopingVideo = true;
+                _isVideoLoaded = false;
+                _lastVlcRawTime = -1;
+
+                // Скидаємо прозорість для фейду
+                VideoPlayer.Opacity = 0.0;
+                _currentOpacity = 0.0;
+
+                lock (_vlcLock)
+                {
+                    using var media = new LibVLCSharp.Shared.Media(_libVLC, path);
+                    media.AddOption(":input-repeat=65535");
+                    media.AddOption(":no-audio");
+                    _vlcPlayer.Play(media);
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"[LOCAL ERROR] {ex.Message}", "error");
+                _isLocalLoopPlaying = false;
+            }
+        }
+
         protected override void OnClosed(EventArgs e)
         {
             try
             {
                 _monitorTimer.Stop();
-                _fadeTimer.Stop(); // Зупиняємо fade таймер
+                _fadeTimer.Stop();
                 _searchCts?.Cancel();
-
-                lock (_vlcLock)
-                {
-                    _vlcPlayer.Stop();
-                    _vlcPlayer.Dispose();
-                }
+                lock (_vlcLock) { _vlcPlayer.Stop(); _vlcPlayer.Dispose(); }
                 _libVLC.Dispose();
             }
-            catch (Exception ex)
-            {
-                Log($"Cleanup error: {ex.Message}", "error");
-            }
+            catch { }
             base.OnClosed(e);
         }
 
@@ -227,24 +301,15 @@ namespace WallpaperMusicPlayer
             {
                 var session = GetRelevantSession(_mediaManager);
 
+                // 1. Якщо плеєри закриті (немає сесії)
                 if (session == null)
                 {
-                    if (_vlcPlayer.IsPlaying)
+                    // Якщо зараз не грає локальний луп (або якщо грає loading, а треба idle)
+                    // Тут спрощення: якщо сесії немає, має грати IDLE.
+                    // Перевіряємо, чи ми вже не в режимі IDLE, щоб не спамити Play
+                    if (!_isLocalLoopPlaying)
                     {
-                        Log("[MONITOR] No active session -> Pausing Video", "warning");
-                        
-                        // Плавне зникнення при паузі
-                        _ = Task.Run(async () => 
-                        {
-                            await StartFadeOutAsync();
-                            await Dispatcher.InvokeAsync(() =>
-                            {
-                                lock (_vlcLock)
-                                {
-                                    _vlcPlayer.Pause();
-                                }
-                            });
-                        });
+                        PlayLocalLoop(_idleVideoPath, "No Session");
                     }
                     return;
                 }
@@ -254,38 +319,35 @@ namespace WallpaperMusicPlayer
 
                 if (isMusicPlaying != _wasPlaying)
                 {
-                    Log($"[STATUS CHANGE] Music is now: {(isMusicPlaying ? "PLAYING" : "PAUSED/STOPPED")}", isMusicPlaying ? "success" : "warning");
+                    Log($"[STATUS] Music: {(isMusicPlaying ? "PLAYING" : "PAUSED")}", isMusicPlaying ? "success" : "warning");
                     _wasPlaying = isMusicPlaying;
                 }
 
+                // 2. Якщо музика на ПАУЗІ
                 if (!isMusicPlaying)
                 {
+                    // ВИМОГА: При паузі НЕ показувати idle. 
+                    // Просто ставимо відео на паузу (стоп-кадр).
                     if (_vlcPlayer.IsPlaying)
                     {
                         lock (_vlcLock)
                         {
                             _vlcPlayer.Pause();
                         }
-                        Log("[MONITOR] Sync Pause executed", "info");
+                        Log("[MONITOR] Video Paused", "info");
                     }
 
+                    // Оновлюємо таймер (статичний)
                     var timelinePaused = session.GetTimelineProperties();
                     TimeSpan pausedTime = timelinePaused?.Position ?? TimeSpan.Zero;
-                    UpdateTimingDisplay(pausedTime, TimeSpan.FromMilliseconds(_vlcPlayer.Time), false, false);
-
-                    _lastVlcRawTime = -1;
+                    UpdateTimingDisplay(pausedTime, TimeSpan.Zero, false, false);
                     return;
                 }
 
-                if (_isVideoLoaded && !_vlcPlayer.IsPlaying)
+                // Якщо музика грає, а VLC стоїть (з паузи вийшли)
+                if (!_vlcPlayer.IsPlaying && _isVideoLoaded)
                 {
-                    Log("[MONITOR] Resuming Video...", "info");
-                    lock (_vlcLock)
-                    {
-                        _vlcPlayer.Play();
-                    }
-                    _lastVlcRawTime = -1;
-                    _lastVlcUpdateTime = DateTime.Now; // ВИПРАВЛЕННЯ: Оновлюємо час
+                    lock (_vlcLock) { _vlcPlayer.Play(); }
                 }
 
                 var info = await session.TryGetMediaPropertiesAsync();
@@ -294,30 +356,43 @@ namespace WallpaperMusicPlayer
                 string currentSong = (!string.IsNullOrEmpty(artist) || !string.IsNullOrEmpty(title))
                                      ? $"{artist} - {title}" : "Unknown";
 
+                // 3. Зміна треку
                 if (currentSong != "Unknown" && currentSong != _lastSong)
                 {
                     _lastSong = currentSong;
 
+                    // ВИМОГА: При зміні треку показувати LOADING (інший idle)
+                    PlayLocalLoop(_loadingVideoPath, "Track Switch");
+
+                    // Скидаємо змінні
                     _isVideoLoaded = false;
                     _isLoopingVideo = false;
                     _lastVlcRawTime = -1;
-                    _smoothedDiff = 0;
-                    _syncDiff = 0;
                     _displayDiff = 0;
-                    _diffHistory.Clear(); // ВИПРАВЛЕННЯ: Скидаємо фільтр
+                    _syncDiff = 0;
+                    _diffHistory.Clear();
 
                     _searchCts?.Cancel();
                     _searchCts = new CancellationTokenSource();
 
-                    Log($"♪ Track Changed: {currentSong}", "info");
+                    Log($"♪ Next Track: {currentSong}", "info");
 
+                    // Починаємо пошук, поки грає loading.mp4
                     _ = ProcessSongAsync(currentSong, _searchCts.Token);
                 }
 
-                // Математика часу
+                // Якщо грає будь-який локальний файл (loading або idle), пропускаємо сінхронізацію
+                if (_isLocalLoopPlaying)
+                {
+                    UpdateTimingDisplay(TimeSpan.Zero, TimeSpan.Zero, true, false);
+                    TxtDiff.Text = "LOCAL";
+                    TxtDiff.Foreground = Brushes.Cyan;
+                    return;
+                }
+
+                // --- Синхронізація (для YouTube відео) ---
                 var timeline = session.GetTimelineProperties();
                 TimeSpan liveAudioTime = TimeSpan.Zero;
-
                 if (timeline != null)
                 {
                     liveAudioTime = timeline.Position + (DateTimeOffset.Now - timeline.LastUpdatedTime);
@@ -325,8 +400,6 @@ namespace WallpaperMusicPlayer
 
                 long currentRawVlcTime = _vlcPlayer.Time;
                 TimeSpan smoothVlcTime;
-
-                // ПОКРАЩЕННЯ: Детекція застрягання VLC
                 bool vlcTimeUpdated = false;
 
                 if (currentRawVlcTime >= 0 && currentRawVlcTime != _lastVlcRawTime)
@@ -341,11 +414,8 @@ namespace WallpaperMusicPlayer
                     if (_lastVlcRawTime >= 0 && _vlcPlayer.IsPlaying)
                     {
                         double msPassed = (DateTime.Now - _lastVlcUpdateTime).TotalMilliseconds;
-                        
-                        // ВИПРАВЛЕННЯ: Якщо VLC не оновлювався > 500мс, щось не так
                         if (msPassed > 500)
                         {
-                            // Примусово оновлюємо
                             _lastVlcRawTime = _vlcPlayer.Time;
                             _lastVlcUpdateTime = DateTime.Now;
                             smoothVlcTime = TimeSpan.FromMilliseconds(_lastVlcRawTime);
@@ -355,12 +425,7 @@ namespace WallpaperMusicPlayer
                         {
                             double safeRate = Math.Min(_vlcPlayer.Rate, 1.05);
                             double extrapolatedMs = _lastVlcRawTime + (msPassed * safeRate);
-                            
-                            if (_vlcPlayer.Length > 0 && extrapolatedMs > _vlcPlayer.Length)
-                            {
-                                extrapolatedMs = _vlcPlayer.Length;
-                            }
-                            
+                            if (_vlcPlayer.Length > 0 && extrapolatedMs > _vlcPlayer.Length) extrapolatedMs = _vlcPlayer.Length;
                             smoothVlcTime = TimeSpan.FromMilliseconds(extrapolatedMs);
                         }
                     }
@@ -379,37 +444,25 @@ namespace WallpaperMusicPlayer
             }
             catch (Exception ex)
             {
-                // ВИПРАВЛЕННЯ: Логуємо критичні помилки
-                if (ex is not OperationCanceledException)
-                {
-                    Log($"[MONITOR] Error: {ex.Message}", "error");
-                }
+                if (ex is not OperationCanceledException) Log($"[MONITOR] Error: {ex.Message}", "error");
             }
         }
 
         // ==========================================
-        // СИСТЕМА ПЛАВНИХ ПЕРЕХОДІВ
+        // ПЛАВНІ ПЕРЕХОДИ (Без змін)
         // ==========================================
-
         private void StartFadeIn()
         {
             if (_isFading) return;
-            
             _isFading = true;
-            _currentOpacity = 0.0;
-            VideoPlayer.Opacity = 0.0;
             _fadeTimer.Start();
-            
-            Log("[FADE] Starting fade-in", "info");
         }
 
         private async Task StartFadeOutAsync()
         {
             if (_isFading || VideoPlayer.Opacity < 0.1) return;
-            
             _isFading = true;
             var tcs = new TaskCompletionSource<bool>();
-            
             EventHandler? handler = null;
             handler = (s, e) =>
             {
@@ -421,42 +474,33 @@ namespace WallpaperMusicPlayer
                     tcs.TrySetResult(true);
                 }
             };
-            
             _fadeTimer.Tick += handler;
             _fadeTimer.Start();
-            
-            Log("[FADE] Starting fade-out", "info");
-            
-            // Чекаємо завершення з таймаутом
             await Task.WhenAny(tcs.Task, Task.Delay(1000));
         }
 
         private void FadeTimer_Tick(object? sender, EventArgs e)
         {
-            // Fade-In (швидше)
             if (_currentOpacity < VideoPlayer.Opacity || (_currentOpacity < 1.0 && VideoPlayer.Opacity >= _currentOpacity))
             {
-                _currentOpacity += 0.08; // Швидкість появи (за ~0.3 сек)
+                _currentOpacity += 0.08;
                 if (_currentOpacity >= 1.0)
                 {
                     _currentOpacity = 1.0;
                     VideoPlayer.Opacity = 1.0;
                     _fadeTimer.Stop();
                     _isFading = false;
-                    Log("[FADE] Fade-in complete", "success");
                     return;
                 }
                 VideoPlayer.Opacity = _currentOpacity;
             }
-            // Fade-Out (повільніше для плавності)
             else if (_currentOpacity > VideoPlayer.Opacity || (_currentOpacity > 0.0 && VideoPlayer.Opacity <= _currentOpacity))
             {
-                _currentOpacity -= 0.05; // Швидкість зникнення (за ~0.5 сек)
+                _currentOpacity -= 0.05;
                 if (_currentOpacity <= 0.0)
                 {
                     _currentOpacity = 0.0;
                     VideoPlayer.Opacity = 0.0;
-                    // Зупинка відбудеться в StartFadeOutAsync
                     return;
                 }
                 VideoPlayer.Opacity = _currentOpacity;
@@ -468,94 +512,53 @@ namespace WallpaperMusicPlayer
             try
             {
                 var allSessions = manager.GetSessions();
-
                 foreach (var session in allSessions)
                 {
                     try
                     {
                         var info = session.GetPlaybackInfo();
                         if (info != null && info.PlaybackStatus == GlobalSystemMediaTransportControlsSessionPlaybackStatus.Playing)
-                        {
                             return session;
-                        }
                     }
-                    catch
-                    {
-                        continue;
-                    }
+                    catch { continue; }
                 }
-
                 return manager.GetCurrentSession();
             }
-            catch
-            {
-                return null; // ВИПРАВЛЕННЯ: Повертаємо null при помилці
-            }
+            catch { return null; }
         }
 
         private void SyncVideoState(TimeSpan targetAudio, TimeSpan currentVideo)
         {
-            if (_isLoopingVideo) return;
+            if (_isLoopingVideo || _isLocalLoopPlaying) return;
 
-            // ПРИСКОРЕННЯ: Зменшено cooldown з 2.0 до 1.0 секунди
             if ((DateTime.Now - _lastSeekTime).TotalSeconds < 1.0) return;
 
             try
             {
                 double instantDiff = (targetAudio - currentVideo).TotalSeconds;
+                if (double.IsNaN(instantDiff) || double.IsInfinity(instantDiff)) return;
 
-                if (double.IsNaN(instantDiff) || double.IsInfinity(instantDiff))
-                {
-                    return;
-                }
-
-                // ==========================================
-                // ПРИСКОРЕНА СИСТЕМА ФІЛЬТРАЦІЇ
-                // ==========================================
-
-                // 1. Додаємо в історію (тепер тільки 5 значень)
                 _diffHistory.Enqueue(instantDiff);
                 if (_diffHistory.Count > 5) _diffHistory.Dequeue();
 
-                // 2. Медіанний фільтр для відкидання викидів
                 var sortedDiffs = _diffHistory.OrderBy(x => x).ToList();
                 double medianDiff = sortedDiffs[sortedDiffs.Count / 2];
 
-                // 3. Дві незалежні згладжені величини:
-                
-                // Для ВІДОБРАЖЕННЯ (плавно, альфа=0.25 - швидше ніж 0.15)
                 _displayDiff = (_displayDiff * 0.75) + (medianDiff * 0.25);
-                
-                // Для СИНХРОНІЗАЦІЇ (дуже швидка реакція, альфа=0.6)
                 _syncDiff = (_syncDiff * 0.4) + (medianDiff * 0.6);
 
-                // 4. Використовуємо _displayDiff тільки для UI
                 TxtDiff.Text = $"{_displayDiff:+0.00;-0.00;0.00}s";
-
-                // 5. Використовуємо _syncDiff для логіки синхронізації
                 double absDiff = Math.Abs(_syncDiff);
 
-                // ==========================================
-                // ПРИСКОРЕНА ЛОГІКА СИНХРОНІЗАЦІЇ
-                // ==========================================
-
-                // Hard Reset (знизили поріг з 5 до 3 секунд)
                 if (absDiff > 3.0)
                 {
                     long targetMs = (long)targetAudio.TotalMilliseconds;
                     if (_vlcPlayer.Length > 0 && targetMs >= 0 && targetMs < _vlcPlayer.Length)
                     {
-                        Log($"[SYNC] HARD RESET: {absDiff:F2}s", "error");
-                        lock (_vlcLock)
-                        {
-                            _vlcPlayer.Time = targetMs;
-                            _vlcPlayer.SetRate(1.0f);
-                        }
+                        lock (_vlcLock) { _vlcPlayer.Time = targetMs; _vlcPlayer.SetRate(1.0f); }
                         _lastSeekTime = DateTime.Now;
                         _lastVlcRawTime = targetMs;
                         _lastVlcUpdateTime = DateTime.Now;
-                        
-                        // Скидаємо фільтри
                         _syncDiff = 0;
                         _displayDiff = 0;
                         _diffHistory.Clear();
@@ -563,76 +566,46 @@ namespace WallpaperMusicPlayer
                     return;
                 }
 
-                // Soft Reset (знизили поріг з 2.5 до 1.5 секунд)
                 if (absDiff > 1.5 && absDiff <= 3.0)
                 {
                     long targetMs = (long)targetAudio.TotalMilliseconds;
                     if (_vlcPlayer.Length > 0 && targetMs >= 0 && targetMs < _vlcPlayer.Length)
                     {
-                        Log($"[SYNC] Soft jump: {absDiff:F2}s", "warning");
-                        lock (_vlcLock)
-                        {
-                            _vlcPlayer.Time = targetMs;
-                        }
+                        lock (_vlcLock) { _vlcPlayer.Time = targetMs; }
                         _lastSeekTime = DateTime.Now;
                         _lastVlcRawTime = targetMs;
                         _lastVlcUpdateTime = DateTime.Now;
-                        
-                        // НЕ скидаємо фільтри повністю, тільки зменшуємо
                         _syncDiff *= 0.3;
                         _displayDiff *= 0.3;
                     }
                     return;
                 }
 
-                // Мертва зона (зменшена з 0.08 до 0.05 для швидшої реакції)
                 if (absDiff < 0.05)
                 {
-                    if (Math.Abs(_vlcPlayer.Rate - 1.0f) > 0.005f)
-                    {
-                        lock (_vlcLock)
-                        {
-                            _vlcPlayer.SetRate(1.0f);
-                        }
-                    }
+                    if (Math.Abs(_vlcPlayer.Rate - 1.0f) > 0.005f) lock (_vlcLock) { _vlcPlayer.SetRate(1.0f); }
                     return;
                 }
 
-                // ==========================================
-                // АГРЕСИВНА АДАПТИВНА КОРЕКЦІЯ ШВИДКОСТІ
-                // ==========================================
-
                 float targetRate = 1.0f;
-
-                // Використовуємо агресивнішу нелінійну функцію
-                if (_syncDiff > 0.05) // Відео відстає
+                if (_syncDiff > 0.05)
                 {
-                    if (absDiff > 1.0) targetRate = 1.10f;      // Сильно відстає - максимальне прискорення
-                    else if (absDiff > 0.5) targetRate = 1.06f; // Помірно відстає
-                    else if (absDiff > 0.2) targetRate = 1.03f; // Трошки відстає
-                    else targetRate = 1.01f;                     // Мінімально відстає
+                    if (absDiff > 1.0) targetRate = 1.10f;
+                    else if (absDiff > 0.5) targetRate = 1.06f;
+                    else if (absDiff > 0.2) targetRate = 1.03f;
+                    else targetRate = 1.01f;
                 }
-                else if (_syncDiff < -0.05) // Відео спішить
+                else if (_syncDiff < -0.05)
                 {
-                    if (absDiff > 1.0) targetRate = 0.90f;      // Сильно спішить - максимальне уповільнення
-                    else if (absDiff > 0.5) targetRate = 0.94f; // Помірно спішить
-                    else if (absDiff > 0.2) targetRate = 0.97f; // Трошки спішить
-                    else targetRate = 0.99f;                     // Мінімально спішить
+                    if (absDiff > 1.0) targetRate = 0.90f;
+                    else if (absDiff > 0.5) targetRate = 0.94f;
+                    else if (absDiff > 0.2) targetRate = 0.97f;
+                    else targetRate = 0.99f;
                 }
 
-                // Застосовуємо зміну швидкості миттєво (зменшено поріг з 0.005 до 0.003)
-                if (Math.Abs(_vlcPlayer.Rate - targetRate) > 0.003f)
-                {
-                    lock (_vlcLock)
-                    {
-                        _vlcPlayer.SetRate(targetRate);
-                    }
-                }
+                if (Math.Abs(_vlcPlayer.Rate - targetRate) > 0.003f) lock (_vlcLock) { _vlcPlayer.SetRate(targetRate); }
             }
-            catch (Exception ex)
-            {
-                Log($"[SYNC] Error: {ex.Message}", "error");
-            }
+            catch { }
         }
 
         private async Task ProcessSongAsync(string query, CancellationToken token)
@@ -642,7 +615,6 @@ namespace WallpaperMusicPlayer
                 string videoId = "";
                 string streamUrl = "";
 
-                // Кеш
                 lock (_cacheLock)
                 {
                     if (_smartCache.TryGetValue(query, out var cachedData))
@@ -653,44 +625,34 @@ namespace WallpaperMusicPlayer
                             PlayVideo(cachedData.StreamUrl);
                             return;
                         }
-                        else
-                        {
-                            videoId = cachedData.VideoId;
-                        }
+                        else videoId = cachedData.VideoId;
                     }
                 }
 
-                // Пошук
                 if (string.IsNullOrEmpty(videoId))
                 {
                     var searchResults = await _youtube.Search.GetVideosAsync(query, token).CollectAsync(1);
-                    if (searchResults.Count > 0)
-                    {
-                        videoId = searchResults[0].Id.Value;
-                    }
+                    if (searchResults.Count > 0) videoId = searchResults[0].Id.Value;
                     else
                     {
-                        Log($"[SEARCH] No results for: {query}", "warning");
-                        return; // ВИПРАВЛЕННЯ: Виходимо, якщо нічого не знайдено
+                        Log($"[SEARCH] No results: {query}", "warning");
+                        return;
                     }
                 }
 
                 if (token.IsCancellationRequested || string.IsNullOrEmpty(videoId)) return;
 
-                // Отримання посилання
                 try
                 {
                     var manifest = await _youtube.Videos.Streams.GetManifestAsync(videoId, token);
-
                     var videoStream = manifest.GetVideoOnlyStreams()
                         .Where(s => s.Container == Container.Mp4 && s.VideoQuality.MaxHeight <= 1080)
-                        .OrderByDescending(s => s.VideoQuality.MaxHeight) // ВИПРАВЛЕННЯ: Сортуємо за якістю
+                        .OrderByDescending(s => s.VideoQuality.MaxHeight)
                         .FirstOrDefault();
 
                     if (videoStream != null)
                     {
                         streamUrl = videoStream.Url;
-
                         lock (_cacheLock)
                         {
                             _smartCache[query] = new CachedVideo
@@ -699,27 +661,20 @@ namespace WallpaperMusicPlayer
                                 StreamUrl = streamUrl,
                                 ExpiryTime = DateTime.Now.AddHours(5)
                             };
-
                             if (_smartCache.Count > 100)
-                            {
-                                var oldestKey = _smartCache.OrderBy(kv => kv.Value.ExpiryTime).First().Key;
-                                _smartCache.Remove(oldestKey); // ВИПРАВЛЕННЯ: Видаляємо найстаріший
-                            }
+                                _smartCache.Remove(_smartCache.OrderBy(kv => kv.Value.ExpiryTime).First().Key);
                         }
                     }
                     else
                     {
-                        Log($"[ERROR] No suitable stream found for: {videoId}", "error");
+                        Log($"[ERROR] Stream not found for: {videoId}", "error");
                         return;
                     }
                 }
                 catch (Exception ex)
                 {
                     Log($"[ERROR] Manifest: {ex.Message}", "error");
-                    lock (_cacheLock)
-                    {
-                        _smartCache.Remove(query);
-                    }
+                    lock (_cacheLock) { _smartCache.Remove(query); }
                     return;
                 }
 
@@ -731,26 +686,22 @@ namespace WallpaperMusicPlayer
                     PlayVideo(streamUrl);
                 }
             }
-            catch (OperationCanceledException)
-            {
-                Log("[SEARCH] Cancelled", "info");
-            }
-            catch (Exception ex)
-            {
-                Log($"[FATAL] {ex.Message}", "error");
-            }
+            catch (OperationCanceledException) { Log("[SEARCH] Cancelled", "info"); }
+            catch (Exception ex) { Log($"[FATAL] {ex.Message}", "error"); }
         }
 
         private void PlayVideo(string url)
         {
             try
             {
+                // Ми переходимо на основне відео - вимикаємо прапор локального лупа
+                _isLocalLoopPlaying = false;
+
                 _isVideoLoaded = false;
                 _isLoopingVideo = false;
                 _lastVlcRawTime = -1;
 
                 var media = new LibVLCSharp.Shared.Media(_libVLC, new Uri(url));
-
                 media.AddOption(":network-caching=300");
                 media.AddOption(":clock-jitter=0");
                 media.AddOption(":clock-synchro=0");
@@ -759,17 +710,10 @@ namespace WallpaperMusicPlayer
                 media.AddOption(":no-audio");
 
                 Log("[VLC] Fast Play triggered...", "info");
-                
-                // Починаємо з нульовою прозорістю для плавної появи
                 VideoPlayer.Opacity = 0.0;
                 _currentOpacity = 0.0;
-                
-                lock (_vlcLock)
-                {
-                    _vlcPlayer.Play(media);
-                }
-                
-                // Fade-in запуститься автоматично в події VlcPlayer_Playing
+
+                lock (_vlcLock) { _vlcPlayer.Play(media); }
             }
             catch (Exception ex)
             {
@@ -780,26 +724,15 @@ namespace WallpaperMusicPlayer
 
         private void UpdateTimingDisplay(TimeSpan audio, TimeSpan video, bool isPlaying, bool vlcUpdated = false)
         {
-            // ВИПРАВЛЕННЯ: Перевірка на від'ємні значення
             if (audio < TimeSpan.Zero) audio = TimeSpan.Zero;
             if (video < TimeSpan.Zero) video = TimeSpan.Zero;
 
             TxtAudioTime.Text = audio.ToString(@"mm\:ss\.f");
             TxtVideoTime.Text = video.ToString(@"mm\:ss\.f");
 
-            // ПОКРАЩЕННЯ: Індикатор оновлення VLC
-            if (vlcUpdated && _isVideoLoaded)
-            {
-                TxtVideoTime.Foreground = new SolidColorBrush(Color.FromRgb(80, 250, 123)); // Зелений
-            }
-            else if (_isVideoLoaded)
-            {
-                TxtVideoTime.Foreground = new SolidColorBrush(Color.FromRgb(139, 233, 253)); // Блакитний
-            }
-            else
-            {
-                TxtVideoTime.Foreground = Brushes.Gray;
-            }
+            if (vlcUpdated && _isVideoLoaded) TxtVideoTime.Foreground = new SolidColorBrush(Color.FromRgb(80, 250, 123));
+            else if (_isVideoLoaded) TxtVideoTime.Foreground = new SolidColorBrush(Color.FromRgb(139, 233, 253));
+            else TxtVideoTime.Foreground = Brushes.Gray;
 
             if (!isPlaying)
             {
@@ -813,34 +746,19 @@ namespace WallpaperMusicPlayer
 
             if (!_isLoopingVideo)
             {
-                // Використовуємо _displayDiff замість прямого розрахунку
                 double diff = _displayDiff;
-                
-                // ВИПРАВЛЕННЯ: Перевірка на NaN
-                if (double.IsNaN(diff))
-                {
-                    TxtDiff.Text = "---";
-                    TxtDiff.Foreground = Brushes.Gray;
-                    return;
-                }
+                if (double.IsNaN(diff)) { TxtDiff.Text = "---"; TxtDiff.Foreground = Brushes.Gray; return; }
 
                 TxtDiff.Text = $"{diff:+0.00;-0.00;0.00}s";
-
                 double absDiff = Math.Abs(diff);
-                
-                // Адаптивне забарвлення з плавними переходами
-                if (absDiff < 0.3)
-                    TxtDiff.Foreground = new SolidColorBrush(Color.FromRgb(80, 250, 123));   // Зелений - ідеально
-                else if (absDiff < 1.0)
-                    TxtDiff.Foreground = new SolidColorBrush(Color.FromRgb(255, 184, 108));  // Помаранчевий - норм
-                else if (absDiff < 2.0)
-                    TxtDiff.Foreground = new SolidColorBrush(Color.FromRgb(255, 121, 198));  // Рожевий - погано
-                else
-                    TxtDiff.Foreground = new SolidColorBrush(Color.FromRgb(255, 85, 85));    // Червоний - критично
+                if (absDiff < 0.3) TxtDiff.Foreground = new SolidColorBrush(Color.FromRgb(80, 250, 123));
+                else if (absDiff < 1.0) TxtDiff.Foreground = new SolidColorBrush(Color.FromRgb(255, 184, 108));
+                else if (absDiff < 2.0) TxtDiff.Foreground = new SolidColorBrush(Color.FromRgb(255, 121, 198));
+                else TxtDiff.Foreground = new SolidColorBrush(Color.FromRgb(255, 85, 85));
             }
             else
             {
-                TxtDiff.Text = "LOOP";
+                TxtDiff.Text = _isLocalLoopPlaying ? "LOCAL" : "LOOP";
                 TxtDiff.Foreground = Brushes.Cyan;
             }
         }
@@ -850,11 +768,7 @@ namespace WallpaperMusicPlayer
             try
             {
                 string timeStr = DateTime.Now.ToString("HH:mm:ss");
-
-                Task.Run(() =>
-                {
-                    try { File.AppendAllText(_logPath, $"[{timeStr}] {message}{Environment.NewLine}"); } catch { }
-                });
+                Task.Run(() => { try { File.AppendAllText(_logPath, $"[{timeStr}] {message}{Environment.NewLine}"); } catch { } });
 
                 Dispatcher.Invoke(() =>
                 {
@@ -862,7 +776,6 @@ namespace WallpaperMusicPlayer
                     {
                         var paragraph = new Paragraph { Margin = new Thickness(0) };
                         paragraph.Inlines.Add(new Run($"[{timeStr}] ") { Foreground = Brushes.Gray });
-
                         var runMsg = new Run(message);
                         runMsg.Foreground = type switch
                         {
@@ -872,11 +785,8 @@ namespace WallpaperMusicPlayer
                             _ => new SolidColorBrush(Color.FromRgb(139, 233, 253))
                         };
                         paragraph.Inlines.Add(runMsg);
-
                         LogOutput.Document.Blocks.Add(paragraph);
-                        if (LogOutput.Document.Blocks.Count > 100)
-                            LogOutput.Document.Blocks.Remove(LogOutput.Document.Blocks.FirstBlock);
-
+                        if (LogOutput.Document.Blocks.Count > 100) LogOutput.Document.Blocks.Remove(LogOutput.Document.Blocks.FirstBlock);
                         LogOutput.ScrollToEnd();
                     }
                     catch { }

@@ -1,12 +1,15 @@
 ﻿using LibVLCSharp.Shared;
 using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.IO;
+using System.Runtime.InteropServices; // Для роботи з пам'яттю
 using System.Threading;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Documents;
 using System.Windows.Input;
 using System.Windows.Media;
+using System.Windows.Media.Imaging; // Для WriteableBitmap
 using System.Windows.Threading;
 using Windows.Media.Control;
 using YoutubeExplode;
@@ -21,33 +24,33 @@ namespace WallpaperMusicPlayer
         private readonly YoutubeClient _youtube = new();
         private readonly string _logPath;
 
-        // --- Шляхи до локальних відео ---
-        private readonly string _idleVideoPath;    // Коли немає джерела (idle.mp4)
-        private readonly string _loadingVideoPath; // Коли вантажиться трек (loading.mp4)
+        private readonly string _idleVideoPath;
+        private readonly string _loadingVideoPath;
 
         private DateTime _lastSeekTime = DateTime.MinValue;
         private long _lastVlcRawTime = -1;
         private DateTime _lastVlcUpdateTime = DateTime.MinValue;
 
-        // Покращена синхронізація
         private readonly Queue<double> _diffHistory = new Queue<double>(5);
         private double _displayDiff = 0;
         private double _syncDiff = 0;
 
-        // VLC об'єкти
         private LibVLC _libVLC;
         private LibVLCSharp.Shared.MediaPlayer _vlcPlayer;
 
-        // Стан
+        // --- ДЛЯ РЕНДЕРИНГУ В ОДНОМУ ВІКНІ ---
+        private WriteableBitmap _videoBitmap;
+        private IntPtr _videoBuffer;
+        // Налаштування роздільної здатності відео (Full HD)
+        // Можна зменшити до 1280x720, якщо слабкий ПК
+        private const uint VideoWidth = 1920;
+        private const uint VideoHeight = 1080;
+        private const uint VideoPitch = VideoWidth * 4; // 4 байти на піксель (RGBA)
+        // -------------------------------------
+
         private string _lastSong = "";
         private CancellationTokenSource? _searchCts;
 
-        // Плавні переходи
-        private readonly DispatcherTimer _fadeTimer = new();
-        private bool _isFading = false;
-        private double _currentOpacity = 1.0;
-
-        // Кеш
         private struct CachedVideo
         {
             public string VideoId;
@@ -57,32 +60,81 @@ namespace WallpaperMusicPlayer
 
         private readonly Dictionary<string, CachedVideo> _smartCache = new();
 
-        // Таймери та час
         private readonly DispatcherTimer _monitorTimer = new();
         private bool _isVideoLoaded = false;
         private bool _isLoopingVideo = false;
         private bool _wasPlaying = false;
-
-        // --- Прапор локального лупу ---
         private bool _isLocalLoopPlaying = false;
 
         private readonly object _vlcLock = new object();
         private readonly object _cacheLock = new object();
+
+        private int _tickCounter = 0;
 
         public MainWindow()
         {
             InitializeComponent();
             _logPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "debug_log.txt");
 
-            // Ініціалізація шляхів
             string baseDir = AppDomain.CurrentDomain.BaseDirectory;
-            _idleVideoPath = Path.Combine(baseDir, "idle.mp4");       // Головна заглушка (офлайн)
-            _loadingVideoPath = Path.Combine(baseDir, "loading.mp4"); // Перехідна заглушка
+            _idleVideoPath = Path.Combine(baseDir, "idle.mp4");
+            _loadingVideoPath = Path.Combine(baseDir, "loading.mp4");
 
             Core.Initialize();
             _libVLC = new LibVLC();
             _vlcPlayer = new LibVLCSharp.Shared.MediaPlayer(_libVLC);
-            VideoPlayer.MediaPlayer = _vlcPlayer;
+
+            // Налаштовуємо "прямий" рендеринг у картинку
+            SetupVideoRendering();
+        }
+
+        private void SetupVideoRendering()
+        {
+            // Створюємо бітмап у пам'яті
+            _videoBitmap = new WriteableBitmap((int)VideoWidth, (int)VideoHeight, 96, 96, PixelFormats.Pbgra32, null);
+            VideoImage.Source = _videoBitmap;
+            _videoBuffer = _videoBitmap.BackBuffer;
+
+            // Кажемо VLC: "Видавай відео в форматі RV32 (RGBA), такого розміру"
+            _vlcPlayer.SetVideoFormat("RV32", VideoWidth, VideoHeight, VideoPitch);
+
+            // Підписуємось на колбеки (VLC буде викликати ці методи для кожного кадру)
+            _vlcPlayer.SetVideoCallbacks(VideoLock, VideoUnlock, VideoDisplay);
+        }
+
+        // VLC просить буфер, куди писати
+        private IntPtr VideoLock(IntPtr opaque, IntPtr planes)
+        {
+            // Ми не блокуємо бітмап тут (це робиться в UI потоці), просто даємо адресу
+            Marshal.WriteIntPtr(planes, _videoBuffer);
+            return IntPtr.Zero;
+        }
+
+        // VLC закінчив писати
+        private void VideoUnlock(IntPtr opaque, IntPtr picture, IntPtr planes)
+        {
+            // Нічого не робимо
+        }
+
+        // VLC каже: "Кадр готовий, показуй!"
+        private void VideoDisplay(IntPtr opaque, IntPtr picture)
+        {
+            // Оскільки ми не в UI потоці, треба попросити UI оновитись
+            try
+            {
+                Dispatcher.BeginInvoke(() =>
+                {
+                    try
+                    {
+                        _videoBitmap.Lock();
+                        // Позначаємо всю область як змінену, щоб WPF перемалював її
+                        _videoBitmap.AddDirtyRect(new Int32Rect(0, 0, (int)VideoWidth, (int)VideoHeight));
+                        _videoBitmap.Unlock();
+                    }
+                    catch { }
+                }, DispatcherPriority.Render);
+            }
+            catch { }
         }
 
         private void Window_Loaded(object sender, RoutedEventArgs e)
@@ -94,8 +146,6 @@ namespace WallpaperMusicPlayer
             _vlcPlayer.EndReached += VlcPlayer_EndReached;
 
             InitializeAsync();
-
-            // На старті запускаємо idle.mp4
             PlayLocalLoop(_idleVideoPath, "Startup");
         }
 
@@ -110,7 +160,6 @@ namespace WallpaperMusicPlayer
                 else
                 {
                     DebugPanel.Visibility = Visibility.Visible;
-                    // Прокручуємо лог вниз при відкритті
                     LogOutput.ScrollToEnd();
                 }
             }
@@ -163,19 +212,14 @@ namespace WallpaperMusicPlayer
             Dispatcher.InvokeAsync(() =>
             {
                 _isVideoLoaded = true;
-
-                // Якщо це локальний луп, просто плавно показуємо
                 if (_isLocalLoopPlaying)
                 {
                     Log("[VLC] Local Loop Playing", "success");
-                    StartFadeIn();
                     return;
                 }
 
                 Log("[VLC] Status: Playing", "success");
-                StartFadeIn();
 
-                // Швидкий стрибок для онлайн відео
                 try
                 {
                     if (_mediaManager != null)
@@ -214,8 +258,6 @@ namespace WallpaperMusicPlayer
             {
                 Log("[VLC] Critical Error", "error");
                 _isVideoLoaded = false;
-
-                // Якщо помилка, пробуємо запустити loading.mp4 як fallback
                 if (!_isLocalLoopPlaying)
                 {
                     PlayLocalLoop(_loadingVideoPath, "Error Recovery");
@@ -239,7 +281,6 @@ namespace WallpaperMusicPlayer
             }
         }
 
-        // --- Універсальний метод для локальних файлів (idle або loading) ---
         private void PlayLocalLoop(string path, string reason)
         {
             if (!File.Exists(path))
@@ -248,21 +289,15 @@ namespace WallpaperMusicPlayer
                 return;
             }
 
-            // Перевіряємо, чи ми вже не граємо цей файл, щоб не перезапускати дарма
-            // Але якщо це переключення між idle і loading, треба перезапустити
-
             try
             {
                 Log($"[LOCAL] Playing {Path.GetFileName(path)} ({reason})", "info");
-
                 _isLocalLoopPlaying = true;
                 _isLoopingVideo = true;
                 _isVideoLoaded = false;
                 _lastVlcRawTime = -1;
-
-                // Скидаємо прозорість для фейду
-                VideoPlayer.Opacity = 0.0;
-                _currentOpacity = 0.0;
+                // Fade effect removed for simplicity in Bitmap mode (can be added via Opacity on Image)
+                VideoImage.Opacity = 1.0;
 
                 lock (_vlcLock)
                 {
@@ -284,8 +319,9 @@ namespace WallpaperMusicPlayer
             try
             {
                 _monitorTimer.Stop();
-                _fadeTimer.Stop();
                 _searchCts?.Cancel();
+                // Важливо скинути колбеки перед виходом, щоб уникнути крашу
+                _vlcPlayer.SetVideoCallbacks(null, null, null);
                 lock (_vlcLock) { _vlcPlayer.Stop(); _vlcPlayer.Dispose(); }
                 _libVLC.Dispose();
             }
@@ -295,18 +331,16 @@ namespace WallpaperMusicPlayer
 
         private async void MonitorLoop(object? sender, EventArgs e)
         {
+            UpdateWindowDiagnostics();
+
             if (_mediaManager == null) return;
 
             try
             {
                 var session = GetRelevantSession(_mediaManager);
 
-                // 1. Якщо плеєри закриті (немає сесії)
                 if (session == null)
                 {
-                    // Якщо зараз не грає локальний луп (або якщо грає loading, а треба idle)
-                    // Тут спрощення: якщо сесії немає, має грати IDLE.
-                    // Перевіряємо, чи ми вже не в режимі IDLE, щоб не спамити Play
                     if (!_isLocalLoopPlaying)
                     {
                         PlayLocalLoop(_idleVideoPath, "No Session");
@@ -323,28 +357,19 @@ namespace WallpaperMusicPlayer
                     _wasPlaying = isMusicPlaying;
                 }
 
-                // 2. Якщо музика на ПАУЗІ
                 if (!isMusicPlaying)
                 {
-                    // ВИМОГА: При паузі НЕ показувати idle. 
-                    // Просто ставимо відео на паузу (стоп-кадр).
                     if (_vlcPlayer.IsPlaying)
                     {
-                        lock (_vlcLock)
-                        {
-                            _vlcPlayer.Pause();
-                        }
+                        lock (_vlcLock) { _vlcPlayer.Pause(); }
                         Log("[MONITOR] Video Paused", "info");
                     }
-
-                    // Оновлюємо таймер (статичний)
                     var timelinePaused = session.GetTimelineProperties();
                     TimeSpan pausedTime = timelinePaused?.Position ?? TimeSpan.Zero;
                     UpdateTimingDisplay(pausedTime, TimeSpan.Zero, false, false);
                     return;
                 }
 
-                // Якщо музика грає, а VLC стоїть (з паузи вийшли)
                 if (!_vlcPlayer.IsPlaying && _isVideoLoaded)
                 {
                     lock (_vlcLock) { _vlcPlayer.Play(); }
@@ -356,15 +381,11 @@ namespace WallpaperMusicPlayer
                 string currentSong = (!string.IsNullOrEmpty(artist) || !string.IsNullOrEmpty(title))
                                      ? $"{artist} - {title}" : "Unknown";
 
-                // 3. Зміна треку
                 if (currentSong != "Unknown" && currentSong != _lastSong)
                 {
                     _lastSong = currentSong;
-
-                    // ВИМОГА: При зміні треку показувати LOADING (інший idle)
                     PlayLocalLoop(_loadingVideoPath, "Track Switch");
 
-                    // Скидаємо змінні
                     _isVideoLoaded = false;
                     _isLoopingVideo = false;
                     _lastVlcRawTime = -1;
@@ -376,12 +397,9 @@ namespace WallpaperMusicPlayer
                     _searchCts = new CancellationTokenSource();
 
                     Log($"♪ Next Track: {currentSong}", "info");
-
-                    // Починаємо пошук, поки грає loading.mp4
                     _ = ProcessSongAsync(currentSong, _searchCts.Token);
                 }
 
-                // Якщо грає будь-який локальний файл (loading або idle), пропускаємо сінхронізацію
                 if (_isLocalLoopPlaying)
                 {
                     UpdateTimingDisplay(TimeSpan.Zero, TimeSpan.Zero, true, false);
@@ -390,7 +408,6 @@ namespace WallpaperMusicPlayer
                     return;
                 }
 
-                // --- Синхронізація (для YouTube відео) ---
                 var timeline = session.GetTimelineProperties();
                 TimeSpan liveAudioTime = TimeSpan.Zero;
                 if (timeline != null)
@@ -448,63 +465,52 @@ namespace WallpaperMusicPlayer
             }
         }
 
-        // ==========================================
-        // ПЛАВНІ ПЕРЕХОДИ (Без змін)
-        // ==========================================
-        private void StartFadeIn()
+        private void UpdateWindowDiagnostics()
         {
-            if (_isFading) return;
-            _isFading = true;
-            _fadeTimer.Start();
-        }
+            try
+            {
+                _tickCounter++;
 
-        private async Task StartFadeOutAsync()
-        {
-            if (_isFading || VideoPlayer.Opacity < 0.1) return;
-            _isFading = true;
-            var tcs = new TaskCompletionSource<bool>();
-            EventHandler? handler = null;
-            handler = (s, e) =>
-            {
-                if (_currentOpacity <= 0.0)
+                // 1. Інформація про процеси (оновлюємо рідше, щоб не вантажити CPU)
+                if (_tickCounter % 10 == 0)
                 {
-                    _fadeTimer.Tick -= handler;
-                    _fadeTimer.Stop();
-                    _isFading = false;
-                    tcs.TrySetResult(true);
-                }
-            };
-            _fadeTimer.Tick += handler;
-            _fadeTimer.Start();
-            await Task.WhenAny(tcs.Task, Task.Delay(1000));
-        }
+                    var currentProcess = Process.GetCurrentProcess();
+                    string pName = currentProcess.ProcessName;
+                    var processes = Process.GetProcessesByName(pName);
 
-        private void FadeTimer_Tick(object? sender, EventArgs e)
-        {
-            if (_currentOpacity < VideoPlayer.Opacity || (_currentOpacity < 1.0 && VideoPlayer.Opacity >= _currentOpacity))
-            {
-                _currentOpacity += 0.08;
-                if (_currentOpacity >= 1.0)
-                {
-                    _currentOpacity = 1.0;
-                    VideoPlayer.Opacity = 1.0;
-                    _fadeTimer.Stop();
-                    _isFading = false;
-                    return;
+                    TxtProcessCount.Text = processes.Length.ToString();
+                    // Якщо процесів > 1, підсвічуємо червоним
+                    TxtProcessCount.Foreground = processes.Length > 1 ? Brushes.Red : Brushes.White;
+
+                    TxtProcessId.Text = currentProcess.Id.ToString();
                 }
-                VideoPlayer.Opacity = _currentOpacity;
+
+                // 2. Інформація про вікна
+                var windows = Application.Current.Windows;
+                TxtWindowCount.Text = windows.Count.ToString();
+
+                // В режимі "Single Window" ми очікуємо рівно 1 вікно.
+                if (windows.Count == 1)
+                    TxtWindowCount.Foreground = Brushes.Green; // Ідеально
+                else
+                    TxtWindowCount.Foreground = Brushes.Yellow; // Підозріло (але може бути VS)
+
+                // 3. Детальний стан головного вікна
+                TxtVisibility.Text = this.Visibility.ToString();
+                if (this.Visibility != Visibility.Visible) TxtVisibility.Foreground = Brushes.Red;
+                else TxtVisibility.Foreground = Brushes.White;
+
+                TxtWindowState.Text = this.WindowState.ToString();
+                TxtTopmost.Text = this.Topmost.ToString();
+
+                // Реальний розмір вікна
+                TxtRenderSize.Text = $"{this.ActualWidth:F0}x{this.ActualHeight:F0}";
+
+                // Системний Handle
+                var helper = new System.Windows.Interop.WindowInteropHelper(this);
+                TxtHandle.Text = "0x" + helper.Handle.ToString("X8");
             }
-            else if (_currentOpacity > VideoPlayer.Opacity || (_currentOpacity > 0.0 && VideoPlayer.Opacity <= _currentOpacity))
-            {
-                _currentOpacity -= 0.05;
-                if (_currentOpacity <= 0.0)
-                {
-                    _currentOpacity = 0.0;
-                    VideoPlayer.Opacity = 0.0;
-                    return;
-                }
-                VideoPlayer.Opacity = _currentOpacity;
-            }
+            catch { }
         }
 
         private GlobalSystemMediaTransportControlsSession? GetRelevantSession(GlobalSystemMediaTransportControlsSessionManager manager)
@@ -694,12 +700,12 @@ namespace WallpaperMusicPlayer
         {
             try
             {
-                // Ми переходимо на основне відео - вимикаємо прапор локального лупа
                 _isLocalLoopPlaying = false;
-
                 _isVideoLoaded = false;
                 _isLoopingVideo = false;
                 _lastVlcRawTime = -1;
+                // Fade effect not implemented in Bitmap mode to keep it simple
+                VideoImage.Opacity = 1.0;
 
                 var media = new LibVLCSharp.Shared.Media(_libVLC, new Uri(url));
                 media.AddOption(":network-caching=300");
@@ -710,8 +716,6 @@ namespace WallpaperMusicPlayer
                 media.AddOption(":no-audio");
 
                 Log("[VLC] Fast Play triggered...", "info");
-                VideoPlayer.Opacity = 0.0;
-                _currentOpacity = 0.0;
 
                 lock (_vlcLock) { _vlcPlayer.Play(media); }
             }

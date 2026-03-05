@@ -1,4 +1,5 @@
-﻿using LibVLCSharp.Shared;
+﻿using FuzzySharp;
+using LibVLCSharp.Shared;
 using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.IO;
@@ -649,8 +650,12 @@ namespace WallpaperMusicPlayer
                     // а _searchCts може бути замінено до завершення задачі
                     var token = _searchCts.Token;
 
+                    // Отримуємо тривалість треку для scoring'у
+                    var timelineForDuration = session.GetTimelineProperties();
+                    TimeSpan trackDuration = timelineForDuration?.EndTime ?? TimeSpan.Zero;
+
                     Log($"♪ Next Track: {currentSong}", "info");
-                    _ = ProcessSongAsync(currentSong, token);
+                    _ = ProcessSongAsync(currentSong, artist.Trim(), title.Trim(), trackDuration, token);
                 }
 
                 if (_isLocalLoopPlaying)
@@ -737,9 +742,9 @@ namespace WallpaperMusicPlayer
         {
             try
             {
-                using var currentProcess = Process.GetCurrentProcess();
+                using var currentProcess = System.Diagnostics.Process.GetCurrentProcess();
                 string pName = currentProcess.ProcessName;
-                var processes = Process.GetProcessesByName(pName);
+                var processes = System.Diagnostics.Process.GetProcessesByName(pName);
 
                 try
                 {
@@ -1002,7 +1007,133 @@ namespace WallpaperMusicPlayer
             return false;
         }
 
-        private async Task ProcessSongAsync(string query, CancellationToken token)
+        /// <summary>
+        /// Скорує результат пошуку YouTube.
+        /// Основа: FuzzySharp TokenSetRatio — релевантність незалежно від порядку слів.
+        /// Підтвердження: автор каналу, тривалість, формат відео.
+        /// Штрафи: явний сміт + контекстні (official audio / Topic якщо є кращий кандидат).
+        /// </summary>
+        private int ScoreVideo(VideoSearchResult video, string artist, string title, TimeSpan trackDuration)
+        {
+            int score = 0;
+            var ytTitle = video.Title.ToLower();
+            var ytAuthor = video.Author.ToLower();
+            var artLow = artist.ToLower();
+            var titleLow = title.ToLower();
+
+            // ================================================================
+            // ОСНОВНИЙ КРИТЕРІЙ — Fuzzy matching (0–100)
+            // TokenSetRatio ігнорує порядок слів і зайві слова в назві —
+            // тому "Veilr Rampant Official Video" і "Rampant Veilr" дадуть ~100.
+            // ================================================================
+
+            string searchQuery = $"{artLow} {titleLow}";
+            int fuzzyScore = Fuzz.TokenSetRatio(searchQuery, ytTitle);
+
+            // Масштабуємо: fuzzy дає 0–100, множимо на 1.5 щоб він домінував над бонусами
+            score += (int)(fuzzyScore * 1.5);
+
+            // ================================================================
+            // ПІДТВЕРДЖУЮЧІ СИГНАЛИ
+            // ================================================================
+
+            // Автор каналу = артист — дуже надійний сигнал
+            if (ytAuthor.Contains(artLow)) score += 30;
+
+            // VEVO канал — завжди офіційний кліп
+            if (ytAuthor.Contains("vevo")) score += 25;
+
+            // "official video" в назві — явний сигнал кліпу
+            // Підняли до +50 щоб завжди перекривав перевагу тривалості
+            if (ytTitle.Contains("official video") ||
+                ytTitle.Contains("official music video")) score += 50;
+
+            // "music video" без "official" — теж кліп
+            // але не рахуємо якщо це небажаний контент
+            bool isBadContent = ytTitle.Contains("fan made")
+                             || ytTitle.Contains("fan-made")
+                             || ytTitle.Contains("karaoke")
+                             || ytTitle.Contains("reaction")
+                             || ytTitle.Contains("lyrics")
+                             || (ytTitle.Contains("cover") && !titleLow.Contains("cover"));
+
+            if (!isBadContent && ytTitle.Contains("music video") &&
+                !ytTitle.Contains("official music video")) score += 30;
+
+            // "trailer" + назва треку одночасно — ігровий/анімаційний кліп
+            if (ytTitle.Contains("trailer") && ytTitle.Contains(titleLow)) score += 20;
+
+            // ================================================================
+            // ЗБІГ ТРИВАЛОСТІ
+            // ================================================================
+
+            if (trackDuration > TimeSpan.Zero && video.Duration > TimeSpan.Zero)
+            {
+                double diffSec = Math.Abs((video.Duration - trackDuration).TotalSeconds);
+
+                if (diffSec < 5) score += 25;
+                else if (diffSec < 15) score += 15;
+                else if (diffSec < 30) score += 5;
+                else if (diffSec > 120) score -= 20;
+            }
+
+            // ================================================================
+            // ШТРАФИ — явний небажаний контент
+            // ================================================================
+
+            if (ytTitle.Contains("karaoke")) score -= 60;
+            if (ytTitle.Contains("1 hour")) score -= 60;
+            if (ytTitle.Contains("reaction")) score -= 50;
+            if (ytTitle.Contains("fan made") ||
+                ytTitle.Contains("fan-made")) score -= 50;
+            if (ytTitle.Contains("cover") && !titleLow.Contains("cover")) score -= 40;
+            if (ytTitle.Contains("lyrics")) score -= 50;
+
+            // YouTube - Topic канали — автоматично згенерований аудіо стрім,
+            // завжди штрафуємо бо YouTube і без нього ставить офіційне аудіо першим
+            if (ytAuthor.EndsWith("- topic")) score -= 70;
+
+            // Штраф за різний алфавіт у залишку назви відео
+            // Наприклад: трек латиницею, а в назві відео є "Караоке" кирилицею
+            string remainder = ytTitle
+                .Replace(titleLow, "")
+                .Replace(artLow, "")
+                .Trim();
+
+            if (!AreSameAlphabetGroup(titleLow, remainder)) score -= 50;
+
+            // Штраф за відсутність відео-маркера — пріоритет на кліпах
+            // VEVO не штрафуємо бо це завжди кліп
+            // Небажаний контент не рахується як валідний маркер
+            bool hasVideoMarker = !isBadContent && (
+                                   ytTitle.Contains("music video")
+                                || ytTitle.Contains("official video")
+                                || ytTitle.Contains("official music video")
+                                || ytTitle.Contains("trailer")
+                                || ytTitle.Contains("clip"))
+                                || ytAuthor.Contains("vevo");
+
+            if (!hasVideoMarker) score -= 50;
+
+            return score;
+        }
+
+        /// <summary>
+        /// Перевіряє чи відео є пріоритетним кліпом:
+        /// official video, VEVO, або trailer з назвою треку.
+        /// </summary>
+        private bool IsVideoPriorityCandidate(VideoSearchResult video, string titleLow)
+        {
+            var ytTitle = video.Title.ToLower();
+            var ytAuthor = video.Author.ToLower();
+
+            return ytTitle.Contains("official video")
+                || ytTitle.Contains("official music video")
+                || ytAuthor.Contains("vevo")
+                || (ytTitle.Contains("trailer") && ytTitle.Contains(titleLow));
+        }
+
+        private async Task ProcessSongAsync(string query, string artist, string title, TimeSpan trackDuration, CancellationToken token)
         {
             try
             {
@@ -1073,12 +1204,51 @@ namespace WallpaperMusicPlayer
                     try
                     {
                         Log($"[SEARCH] Searching for: '{query}'", "info");
-                        var searchResults = await _youtubeWrapper.SearchVideosAsync(query, 1, searchCts.Token);
+
+                        // Запитуємо 5 кандидатів замість 1 — щоб мати з чого вибирати
+                        var searchResults = await _youtubeWrapper.SearchVideosAsync(query, 5, searchCts.Token);
 
                         if (searchResults.Count > 0)
                         {
-                            videoId = searchResults[0].VideoId;
-                            Log($"[SEARCH] Found: {videoId} - '{searchResults[0].Title}' by {searchResults[0].Author}", "success");
+                            string titleLow = title.ToLower();
+
+                            // Перевіряємо чи є серед результатів пріоритетний кліп
+                            // (official video / VEVO / trailer + назва треку)
+                            bool hasPriorityCandidate = searchResults.Any(v => IsVideoPriorityCandidate(v, titleLow));
+
+                            // Скоруємо кожен результат
+                            var scored = searchResults.Select(v =>
+                            {
+                                int s = ScoreVideo(v, artist, title, trackDuration);
+
+                                // Контекстний штраф: якщо є кращий кандидат —
+                                // official audio і Topic канали йдуть на другий план
+                                if (hasPriorityCandidate)
+                                {
+                                    var ytTitle = v.Title.ToLower();
+                                    var ytAuthor = v.Author.ToLower();
+
+                                    if (ytTitle.Contains("official audio")) s -= 40;
+                                    if (ytAuthor.EndsWith("- topic")) s -= 40;
+                                    if (ytTitle.Contains("official lyric video") ||
+                                        ytTitle.Contains("lyric video")) s -= 30;
+                                }
+
+                                return new { Video = v, Score = s };
+                            })
+                            .OrderByDescending(x => x.Score)
+                            .ToList();
+
+                            // Логуємо всіх кандидатів для діагностики
+                            for (int i = 0; i < scored.Count; i++)
+                            {
+                                var v = scored[i];
+                                Log($"[SEARCH] #{i + 1} score={v.Score:+#;-#;0} | '{v.Video.Title}' by {v.Video.Author} ({v.Video.Duration:mm\\:ss})", "info");
+                            }
+
+                            var best = scored[0].Video;
+                            videoId = best.VideoId;
+                            Log($"[SEARCH] Best match: {videoId} - '{best.Title}' by {best.Author} (score={scored[0].Score})", "success");
                         }
                         else
                         {
@@ -1329,6 +1499,36 @@ namespace WallpaperMusicPlayer
                 TxtDiff.Text = _isLocalLoopPlaying ? "LOCAL" : "LOOP";
                 TxtDiff.Foreground = Brushes.Cyan;
             }
+        }
+
+        private static string GetAlphabetBlock(string text)
+        {
+            if (string.IsNullOrWhiteSpace(text)) return "None";
+
+            foreach (char c in text)
+            {
+                if (char.IsLetter(c))
+                {
+                    if (c >= 0x0041 && c <= 0x024F) return "Latin";
+                    if (c >= 0x0400 && c <= 0x04FF) return "Cyrillic";
+                    if (c >= 0x0370 && c <= 0x03FF) return "Greek";
+                    if (c >= 0x0600 && c <= 0x06FF) return "Arabic";
+                    if (c >= 0x0590 && c <= 0x05FF) return "Hebrew";
+                    return "Other";
+                }
+            }
+
+            return "None";
+        }
+
+        private static bool AreSameAlphabetGroup(string str1, string str2)
+        {
+            string block1 = GetAlphabetBlock(str1);
+            string block2 = GetAlphabetBlock(str2);
+
+            if (block1 == "None" || block2 == "None") return true;
+
+            return block1 == block2;
         }
 
         private void Log(string message, string type)

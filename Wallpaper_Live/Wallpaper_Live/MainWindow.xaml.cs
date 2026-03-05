@@ -598,14 +598,12 @@ namespace WallpaperMusicPlayer
                     return;
                 }
 
-                if (_vlcPlayer != null && !_vlcPlayer.IsPlaying && _isVideoLoaded && !_isDisposing)
+                if (_vlcPlayer != null && !_vlcPlayer.IsPlaying && !_isDisposing)
                 {
                     lock (_vlcLock)
                     {
                         if (_vlcPlayer != null && !_isDisposing)
-                        {
                             _vlcPlayer.Play();
-                        }
                     }
                 }
 
@@ -812,29 +810,40 @@ namespace WallpaperMusicPlayer
             }
         }
 
-        private GlobalSystemMediaTransportControlsSession? GetRelevantSession(GlobalSystemMediaTransportControlsSessionManager manager)
+        private GlobalSystemMediaTransportControlsSession? GetRelevantSession(
+            GlobalSystemMediaTransportControlsSessionManager manager)
         {
             try
             {
                 var allSessions = manager.GetSessions();
+
+                GlobalSystemMediaTransportControlsSession? pausedSession = null;
+
                 foreach (var session in allSessions)
                 {
                     try
                     {
                         var info = session.GetPlaybackInfo();
-                        if (info != null && info.PlaybackStatus == GlobalSystemMediaTransportControlsSessionPlaybackStatus.Playing)
+                        if (info == null) continue;
+
+                        // Пріоритет — активна сесія
+                        if (info.PlaybackStatus ==
+                            GlobalSystemMediaTransportControlsSessionPlaybackStatus.Playing)
                             return session;
+
+                        // Запам'ятовуємо паузовану як запасну
+                        if (info.PlaybackStatus ==
+                            GlobalSystemMediaTransportControlsSessionPlaybackStatus.Paused)
+                            pausedSession = session;
                     }
                     catch (Exception ex)
                     {
-                        Log($"[SESSION ERROR] Failed to get session info: {ex.Message}", "error");
-                        continue;
+                        Log($"[SESSION ERROR] {ex.Message}", "error");
                     }
                 }
-                // Повертаємо null якщо жодна сесія не грає.
-                // Раніше тут було GetCurrentSession() — це спричиняло зайві пошуки
-                // на YouTube для треку що зараз не відтворюється.
-                return null;
+
+                // Повертаємо паузовану якщо активної немає
+                return pausedSession;
             }
             catch (Exception ex)
             {

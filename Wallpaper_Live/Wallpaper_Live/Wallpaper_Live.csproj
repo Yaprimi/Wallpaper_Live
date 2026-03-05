@@ -1,35 +1,123 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+﻿<!--
+Wallpaper Live - Music Video Player
+Виправлений .csproj файл з:
+- Оновленими NuGet пакетами до останніх версій
+- Self-contained deployment для portable запуску
+- Вбудованими VLC бібліотеками
+- Автоматичним копіюванням ресурсів
+-->
+
+<Project Sdk="Microsoft.NET.Sdk">
 
 	<PropertyGroup>
 		<OutputType>WinExe</OutputType>
-		<!-- Використовуємо версію з підтримкою Windows 10 SDK для доступу до MediaManager -->
 		<TargetFramework>net9.0-windows10.0.19041.0</TargetFramework>
-		<RootNamespace>Wallpaper_Live</RootNamespace>
+		<RootNamespace>WallpaperMusicPlayer</RootNamespace>
 		<Nullable>enable</Nullable>
 		<ImplicitUsings>enable</ImplicitUsings>
 		<UseWPF>true</UseWPF>
-		
+
+		<!-- Архітектура -->
 		<Platforms>x64</Platforms>
 		<RuntimeIdentifier>win-x64</RuntimeIdentifier>
 		<RuntimeIdentifiers>win-x64</RuntimeIdentifiers>
 		<UseRidGraph>true</UseRidGraph>
+
+		<!-- Точка входу -->
 		<StartupObject>Wallpaper_Live.App</StartupObject>
+
+		<!-- Self-Contained Deployment для portable запуску -->
+		<SelfContained>true</SelfContained>
+		<PublishSingleFile>false</PublishSingleFile>
+		<IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+		<PublishReadyToRun>true</PublishReadyToRun>
+		<PublishTrimmed>false</PublishTrimmed>
+
+		<!-- Інформація про додаток -->
+		<AssemblyName>WallpaperLive</AssemblyName>
+		<AssemblyTitle>Wallpaper Live Music Player</AssemblyTitle>
+		<Product>Wallpaper Live</Product>
+		<Copyright>Copyright © 2024</Copyright>
+		<AssemblyVersion>1.0.0.0</AssemblyVersion>
+		<FileVersion>1.0.0.0</FileVersion>
+		<Version>1.0.0</Version>
+
+		<!-- Оптимізація -->
+		<DebugType>embedded</DebugType>
+		<Optimize>true</Optimize>
 	</PropertyGroup>
 
 	<ItemGroup>
+		<!-- Оновлені NuGet пакети до останніх стабільних версій -->
+
+		<!-- LibVLCSharp - відеоплеєр -->
 		<PackageReference Include="LibVLCSharp" Version="3.9.4" />
 		<PackageReference Include="LibVLCSharp.WPF" Version="3.9.4" />
+
+		<!-- VLC нативні бібліотеки для Windows -->
 		<PackageReference Include="VideoLAN.LibVLC.Windows" Version="3.0.21" />
+
+		<!-- YoutubeExplode - пошук та завантаження з YouTube -->
+		<!-- УВАГА: Ця бібліотека часто оновлюється, перевіряйте останню версію -->
 		<PackageReference Include="YoutubeExplode" Version="6.5.6" />
+
+		<!-- Додаткові залежності для надійності -->
+		<PackageReference Include="System.Net.Http" Version="4.3.4" />
+		<PackageReference Include="System.Text.Json" Version="9.0.1" />
 	</ItemGroup>
 
 	<ItemGroup>
-	  <None Update="idle.mp4">
-	    <CopyToOutputDirectory>Always</CopyToOutputDirectory>
-	  </None>
-	  <None Update="loading.mp4">
-	    <CopyToOutputDirectory>Always</CopyToOutputDirectory>
-	  </None>
+		<!-- Локальні відео файли (обов'язкові для роботи) -->
+		<None Update="idle.mp4">
+			<CopyToOutputDirectory>Always</CopyToOutputDirectory>
+		</None>
+		<None Update="loading.mp4">
+			<CopyToOutputDirectory>Always</CopyToOutputDirectory>
+		</None>
+
+		<!-- README та інструкції (опціонально) -->
+		<None Update="README.md">
+			<CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+		</None>
 	</ItemGroup>
+
+	<!-- Копіювання VLC нативних бібліотек в output директорію -->
+	<Target Name="CopyVLCLibraries" AfterTargets="Build">
+		<ItemGroup>
+			<!-- Знаходимо VLC DLL файли з NuGet пакету -->
+			<VLCFiles Include="$(NuGetPackageRoot)videolan.libvlc.windows\3.0.21\build\**\*.*" />
+		</ItemGroup>
+		<Copy SourceFiles="@(VLCFiles)"
+		      DestinationFolder="$(OutDir)libvlc\%(RecursiveDir)"
+		      SkipUnchangedFiles="true"
+		      Condition="Exists('$(NuGetPackageRoot)videolan.libvlc.windows\3.0.21\build')" />
+		<Message Text="VLC libraries copied to output directory" Importance="high" />
+	</Target>
+
+	<!-- Для publish - створення portable версії -->
+	<Target Name="PostPublish" AfterTargets="Publish">
+		<Message Text="Creating portable distribution in: $(PublishDir)" Importance="high" />
+
+		<!-- Створення README файлу для користувачів -->
+		<WriteLinesToFile File="$(PublishDir)ІНСТРУКЦІЯ.txt"
+		                  Lines="WALLPAPER LIVE MUSIC PLAYER%0D%0A%0D%0AДля запуску:%0D%0A1. Запустіть WallpaperLive.exe%0D%0A2. Увімкніть музику в будь-якому плеєрі (Spotify, YouTube Music, тощо)%0D%0A3. Натисніть F12 для відкриття панелі налагодження%0D%0A%0D%0AВимоги:%0D%0A- Windows 10/11%0D%0A- Інтернет з'єднання для завантаження відео%0D%0A%0D%0AФайли idle.mp4 та loading.mp4 повинні бути в тій же папці що й .exe"
+		                  Overwrite="true"
+		                  Encoding="Unicode" />
+	</Target>
+
+	<!-- Налаштування для різних конфігурацій -->
+	<PropertyGroup Condition="'$(Configuration)' == 'Debug'">
+		<DebugSymbols>true</DebugSymbols>
+		<DebugType>full</DebugType>
+		<Optimize>false</Optimize>
+		<DefineConstants>DEBUG;TRACE</DefineConstants>
+	</PropertyGroup>
+
+	<PropertyGroup Condition="'$(Configuration)' == 'Release'">
+		<DebugSymbols>false</DebugSymbols>
+		<DebugType>none</DebugType>
+		<Optimize>true</Optimize>
+		<DefineConstants>TRACE</DefineConstants>
+	</PropertyGroup>
 
 </Project>

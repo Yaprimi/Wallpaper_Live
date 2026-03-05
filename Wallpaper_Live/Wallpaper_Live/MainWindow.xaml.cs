@@ -2,26 +2,23 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.IO;
-using System.Runtime.InteropServices; // Для роботи з пам'яттю
+using System.Runtime.InteropServices;
 using System.Threading;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Documents;
 using System.Windows.Input;
 using System.Windows.Media;
-using System.Windows.Media.Imaging; // Для WriteableBitmap
+using System.Windows.Media.Imaging;
 using System.Windows.Threading;
 using Windows.Media.Control;
-using YoutubeExplode;
-using YoutubeExplode.Common;
-using YoutubeExplode.Videos.Streams;
 
 namespace WallpaperMusicPlayer
 {
     public partial class MainWindow : Window
     {
         private GlobalSystemMediaTransportControlsSessionManager? _mediaManager;
-        private readonly YoutubeClient _youtube = new();
+        private YoutubeWrapper? _youtubeWrapper;
         private readonly string _logPath;
 
         private readonly string _idleVideoPath;
@@ -35,21 +32,18 @@ namespace WallpaperMusicPlayer
         private double _displayDiff = 0;
         private double _syncDiff = 0;
 
-        private LibVLC _libVLC;
-        private LibVLCSharp.Shared.MediaPlayer _vlcPlayer;
+        private LibVLC? _libVLC;
+        private LibVLCSharp.Shared.MediaPlayer? _vlcPlayer;
 
-        // --- ДЛЯ РЕНДЕРИНГУ В ОДНОМУ ВІКНІ ---
-        private WriteableBitmap _videoBitmap;
-        private IntPtr _videoBuffer;
-        // Налаштування роздільної здатності відео (Full HD)
-        // Можна зменшити до 1280x720, якщо слабкий ПК
+        private WriteableBitmap? _videoBitmap;
+        private IntPtr _videoBuffer = IntPtr.Zero;
         private const uint VideoWidth = 1920;
         private const uint VideoHeight = 1080;
-        private const uint VideoPitch = VideoWidth * 4; // 4 байти на піксель (RGBA)
-        // -------------------------------------
+        private const uint VideoPitch = VideoWidth * 4;
 
         private string _lastSong = "";
         private CancellationTokenSource? _searchCts;
+        private string? _currentSessionId;
 
         private struct CachedVideo
         {
@@ -58,18 +52,31 @@ namespace WallpaperMusicPlayer
             public DateTime ExpiryTime;
         }
 
-        private readonly Dictionary<string, CachedVideo> _smartCache = new();
+        private readonly ConcurrentDictionary<string, CachedVideo> _smartCache = new();
 
         private readonly DispatcherTimer _monitorTimer = new();
+        private readonly DispatcherTimer _cacheCleanupTimer = new();
+        private readonly DispatcherTimer _diagnosticsTimer = new();
+        private readonly DispatcherTimer _youtubeHealthCheckTimer = new();
+
         private bool _isVideoLoaded = false;
         private bool _isLoopingVideo = false;
         private bool _wasPlaying = false;
         private bool _isLocalLoopPlaying = false;
+        private volatile bool _isDisposing = false;
+        private bool _isUpdatingYoutube = false;
 
         private readonly object _vlcLock = new object();
-        private readonly object _cacheLock = new object();
+        private readonly object _logFileLock = new object();
+        private readonly SemaphoreSlim _videoRenderSemaphore = new SemaphoreSlim(1, 1);
 
-        private int _tickCounter = 0;
+        private int _youtubeRequestCount = 0;
+        private DateTime _lastYoutubeRequest = DateTime.MinValue;
+
+        private const int MAX_YOUTUBE_REQUESTS_PER_MINUTE = 10;
+        private const int YOUTUBE_CACHE_HOURS = 5;
+        private const int MAX_CACHE_SIZE = 100;
+        private const int NETWORK_TIMEOUT_SECONDS = 10;
 
         public MainWindow()
         {
@@ -80,73 +87,157 @@ namespace WallpaperMusicPlayer
             _idleVideoPath = Path.Combine(baseDir, "idle.mp4");
             _loadingVideoPath = Path.Combine(baseDir, "loading.mp4");
 
-            Core.Initialize();
-            _libVLC = new LibVLC();
-            _vlcPlayer = new LibVLCSharp.Shared.MediaPlayer(_libVLC);
+            try
+            {
+                Core.Initialize();
+                _libVLC = new LibVLC();
+                _vlcPlayer = new LibVLCSharp.Shared.MediaPlayer(_libVLC);
 
-            // Налаштовуємо "прямий" рендеринг у картинку
-            SetupVideoRendering();
+                SetupVideoRendering();
+            }
+            catch (Exception ex)
+            {
+                Log($"[INIT ERROR] Failed to initialize VLC: {ex.Message}", "error");
+                MessageBox.Show($"Failed to initialize video player: {ex.Message}", "Initialization Error", MessageBoxButton.OK, MessageBoxImage.Error);
+                Application.Current.Shutdown();
+            }
+
+            // Ініціалізація YoutubeWrapper
+            try
+            {
+                _youtubeWrapper = new YoutubeWrapper((msg, type) => Log(msg, type));
+                Log("[YOUTUBE] Wrapper initialized successfully", "success");
+            }
+            catch (Exception ex)
+            {
+                Log($"[YOUTUBE ERROR] Failed to initialize wrapper: {ex.Message}", "error");
+                MessageBox.Show($"Failed to initialize YouTube integration: {ex.Message}\n\nThe application may not work correctly.",
+                    "YouTube Initialization Warning", MessageBoxButton.OK, MessageBoxImage.Warning);
+            }
         }
 
         private void SetupVideoRendering()
         {
-            // Створюємо бітмап у пам'яті
-            _videoBitmap = new WriteableBitmap((int)VideoWidth, (int)VideoHeight, 96, 96, PixelFormats.Pbgra32, null);
-            VideoImage.Source = _videoBitmap;
-            _videoBuffer = _videoBitmap.BackBuffer;
+            if (_vlcPlayer == null) return;
 
-            // Кажемо VLC: "Видавай відео в форматі RV32 (RGBA), такого розміру"
-            _vlcPlayer.SetVideoFormat("RV32", VideoWidth, VideoHeight, VideoPitch);
+            try
+            {
+                _videoBitmap = new WriteableBitmap((int)VideoWidth, (int)VideoHeight, 96, 96, PixelFormats.Pbgra32, null);
+                VideoImage.Source = _videoBitmap;
+                _videoBuffer = _videoBitmap.BackBuffer;
 
-            // Підписуємось на колбеки (VLC буде викликати ці методи для кожного кадру)
-            _vlcPlayer.SetVideoCallbacks(VideoLock, VideoUnlock, VideoDisplay);
+                _vlcPlayer.SetVideoFormat("RV32", VideoWidth, VideoHeight, VideoPitch);
+                _vlcPlayer.SetVideoCallbacks(VideoLock, VideoUnlock, VideoDisplay);
+            }
+            catch (Exception ex)
+            {
+                Log($"[RENDER ERROR] Failed to setup video rendering: {ex.Message}", "error");
+                throw;
+            }
         }
 
-        // VLC просить буфер, куди писати
         private IntPtr VideoLock(IntPtr opaque, IntPtr planes)
         {
-            // Ми не блокуємо бітмап тут (це робиться в UI потоці), просто даємо адресу
-            Marshal.WriteIntPtr(planes, _videoBuffer);
+            if (_videoBuffer == IntPtr.Zero || _isDisposing)
+            {
+                Log("[VIDEO LOCK] Invalid buffer or disposing", "warning");
+                return IntPtr.Zero;
+            }
+
+            try
+            {
+                Marshal.WriteIntPtr(planes, _videoBuffer);
+            }
+            catch (Exception ex)
+            {
+                Log($"[VIDEO LOCK ERROR] {ex.Message}", "error");
+            }
+
             return IntPtr.Zero;
         }
 
-        // VLC закінчив писати
         private void VideoUnlock(IntPtr opaque, IntPtr picture, IntPtr planes)
         {
-            // Нічого не робимо
+            // Cleanup відбувається в Dispose
         }
 
-        // VLC каже: "Кадр готовий, показуй!"
         private void VideoDisplay(IntPtr opaque, IntPtr picture)
         {
-            // Оскільки ми не в UI потоці, треба попросити UI оновитись
+            if (_videoBitmap == null || _isDisposing)
+                return;
+
             try
             {
+                if (!_videoRenderSemaphore.Wait(0))
+                    return;
+
                 Dispatcher.BeginInvoke(() =>
                 {
                     try
                     {
-                        _videoBitmap.Lock();
-                        // Позначаємо всю область як змінену, щоб WPF перемалював її
-                        _videoBitmap.AddDirtyRect(new Int32Rect(0, 0, (int)VideoWidth, (int)VideoHeight));
-                        _videoBitmap.Unlock();
+                        if (_videoBitmap != null && !_isDisposing)
+                        {
+                            _videoBitmap.Lock();
+                            _videoBitmap.AddDirtyRect(new Int32Rect(0, 0, (int)VideoWidth, (int)VideoHeight));
+                            _videoBitmap.Unlock();
+                        }
                     }
-                    catch { }
+                    catch (Exception ex)
+                    {
+                        Log($"[VIDEO DISPLAY ERROR] {ex.Message}", "error");
+                    }
+                    finally
+                    {
+                        if (!_isDisposing)
+                            _videoRenderSemaphore.Release();
+                    }
                 }, DispatcherPriority.Render);
             }
-            catch { }
+            catch (Exception ex)
+            {
+                Log($"[VIDEO DISPLAY ERROR] {ex.Message}", "error");
+                if (!_isDisposing)
+                    _videoRenderSemaphore.Release();
+            }
         }
 
         private void Window_Loaded(object sender, RoutedEventArgs e)
         {
+            if (_vlcPlayer == null)
+            {
+                Log("[ERROR] VLC Player not initialized", "error");
+                return;
+            }
+
             _vlcPlayer.Volume = 0;
             _vlcPlayer.LengthChanged += VlcPlayer_LengthChanged;
             _vlcPlayer.EncounteredError += VlcPlayer_EncounteredError;
             _vlcPlayer.Playing += VlcPlayer_Playing;
             _vlcPlayer.EndReached += VlcPlayer_EndReached;
 
+            _diagnosticsTimer.Interval = TimeSpan.FromSeconds(1);
+            _diagnosticsTimer.Tick += (s, ev) => UpdateWindowDiagnostics();
+            _diagnosticsTimer.Start();
+
+            _cacheCleanupTimer.Interval = TimeSpan.FromMinutes(30);
+            _cacheCleanupTimer.Tick += (s, ev) => CleanupExpiredCache();
+            _cacheCleanupTimer.Start();
+
+            // Таймер перевірки здоров'я YouTube API (кожні 10 хвилин)
+            _youtubeHealthCheckTimer.Interval = TimeSpan.FromMinutes(10);
+            _youtubeHealthCheckTimer.Tick += async (s, ev) => await CheckYoutubeHealthAsync();
+            _youtubeHealthCheckTimer.Start();
+
             InitializeAsync();
-            PlayLocalLoop(_idleVideoPath, "Startup");
+
+            if (File.Exists(_idleVideoPath))
+            {
+                PlayLocalLoop(_idleVideoPath, "Startup");
+            }
+            else
+            {
+                Log("[WARNING] idle.mp4 not found - application may not work correctly", "warning");
+            }
         }
 
         private void Window_KeyDown(object sender, KeyEventArgs e)
@@ -169,12 +260,17 @@ namespace WallpaperMusicPlayer
         {
             Dispatcher.InvokeAsync(() =>
             {
+                if (_vlcPlayer == null || _isDisposing) return;
+
                 if (_isLoopingVideo || _isLocalLoopPlaying)
                 {
                     lock (_vlcLock)
                     {
-                        _vlcPlayer.Stop();
-                        _vlcPlayer.Play();
+                        if (_vlcPlayer != null && !_isDisposing)
+                        {
+                            _vlcPlayer.Stop();
+                            _vlcPlayer.Play();
+                        }
                     }
                 }
             });
@@ -190,19 +286,19 @@ namespace WallpaperMusicPlayer
                 if (_isLocalLoopPlaying)
                 {
                     _isLoopingVideo = true;
-                    Log($"[VLC] Type: Local Loop", "info");
+                    Log($"[VLC] Type: Local Loop (Duration: {TimeSpan.FromMilliseconds(durationMs):mm\\:ss})", "info");
                     return;
                 }
 
-                if (durationMs < 60000)
+                if (durationMs < 90000)
                 {
                     _isLoopingVideo = true;
-                    Log($"[VLC] Type: Online Loop", "info");
+                    Log($"[VLC] Type: Online Loop (Duration: {TimeSpan.FromMilliseconds(durationMs):mm\\:ss})", "info");
                 }
                 else
                 {
                     _isLoopingVideo = false;
-                    Log($"[VLC] Type: Music Video", "info");
+                    Log($"[VLC] Type: Music Video (Duration: {TimeSpan.FromMilliseconds(durationMs):mm\\:ss})", "info");
                 }
             });
         }
@@ -231,24 +327,34 @@ namespace WallpaperMusicPlayer
                             if (timeline != null)
                             {
                                 TimeSpan currentAudioTime = timeline.Position + (DateTimeOffset.Now - timeline.LastUpdatedTime);
-                                if (!_isLoopingVideo && currentAudioTime.TotalSeconds > 1 && _vlcPlayer.Length > 0)
+                                if (!_isLoopingVideo && currentAudioTime.TotalSeconds > 1 && _vlcPlayer != null && _vlcPlayer.Length > 0)
                                 {
                                     long targetMs = (long)currentAudioTime.TotalMilliseconds;
-                                    if (targetMs < _vlcPlayer.Length)
+                                    if (targetMs >= 0 && targetMs < _vlcPlayer.Length)
                                     {
                                         lock (_vlcLock)
                                         {
-                                            _vlcPlayer.Time = targetMs;
-                                            _lastVlcRawTime = targetMs;
-                                            _lastVlcUpdateTime = DateTime.Now;
+                                            if (_vlcPlayer != null && !_isDisposing)
+                                            {
+                                                _vlcPlayer.Time = targetMs;
+                                                _lastVlcRawTime = targetMs;
+                                                _lastVlcUpdateTime = DateTime.Now;
+                                            }
                                         }
                                     }
                                 }
                             }
+                            else
+                            {
+                                Log("[VLC] Timeline is null - cannot sync initial position", "warning");
+                            }
                         }
                     }
                 }
-                catch { }
+                catch (Exception ex)
+                {
+                    Log($"[VLC PLAYING ERROR] {ex.Message}", "error");
+                }
             });
         }
 
@@ -256,11 +362,16 @@ namespace WallpaperMusicPlayer
         {
             Dispatcher.InvokeAsync(() =>
             {
-                Log("[VLC] Critical Error", "error");
+                Log("[VLC] Critical Error - attempting recovery", "error");
                 _isVideoLoaded = false;
-                if (!_isLocalLoopPlaying)
+
+                if (!_isLocalLoopPlaying && File.Exists(_loadingVideoPath))
                 {
                     PlayLocalLoop(_loadingVideoPath, "Error Recovery");
+                }
+                else if (!File.Exists(_loadingVideoPath))
+                {
+                    Log("[ERROR] loading.mp4 not found - cannot recover from error", "error");
                 }
             });
         }
@@ -273,11 +384,59 @@ namespace WallpaperMusicPlayer
                 _monitorTimer.Interval = TimeSpan.FromMilliseconds(100);
                 _monitorTimer.Tick += MonitorLoop;
                 _monitorTimer.Start();
-                Log("Waiting for music...", "success");
+                Log("System media manager initialized - waiting for music...", "success");
+
+                // Перевірка YouTube API при старті
+                await CheckYoutubeHealthAsync();
             }
             catch (Exception ex)
             {
-                Log($"INIT ERROR: {ex.Message}", "error");
+                Log($"[INIT ERROR] Failed to initialize media manager: {ex.Message}", "error");
+                MessageBox.Show("Failed to connect to system media controls. The application may not work correctly.",
+                    "Initialization Warning", MessageBoxButton.OK, MessageBoxImage.Warning);
+            }
+        }
+
+        /// <summary>
+        /// Перевіряє здоров'я YouTube API та оновлює якщо потрібно
+        /// </summary>
+        private async Task CheckYoutubeHealthAsync()
+        {
+            if (_isUpdatingYoutube || _youtubeWrapper == null)
+                return;
+
+            try
+            {
+                _isUpdatingYoutube = true;
+
+                var result = await YoutubeDllUpdater.CheckAndUpdateAsync(_youtubeWrapper, msg => Log(msg, "info"));
+
+                switch (result)
+                {
+                    case UpdateResult.Success:
+                        Log("[YOUTUBE] ✓ API updated and working!", "success");
+                        break;
+                    case UpdateResult.NoUpdateNeeded:
+                        // Все працює - нічого не робимо
+                        break;
+                    case UpdateResult.Failed:
+                        Log("[YOUTUBE] ✗ Update failed, using current version", "warning");
+                        break;
+                    case UpdateResult.ApiFailedOnLatest:
+                        Log("[YOUTUBE] ⚠ Already on latest version but API fails - may be YouTube-side issue", "warning");
+                        break;
+                    case UpdateResult.UpdatedButStillFails:
+                        Log("[YOUTUBE] ⚠ Updated but API still fails - may be temporary YouTube issue", "warning");
+                        break;
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"[YOUTUBE ERROR] Health check failed: {ex.Message}", "error");
+            }
+            finally
+            {
+                _isUpdatingYoutube = false;
             }
         }
 
@@ -285,7 +444,13 @@ namespace WallpaperMusicPlayer
         {
             if (!File.Exists(path))
             {
-                Log($"[LOCAL] File not found: {Path.GetFileName(path)}", "error");
+                Log($"[LOCAL ERROR] File not found: {Path.GetFileName(path)}", "error");
+                return;
+            }
+
+            if (_vlcPlayer == null || _isDisposing)
+            {
+                Log("[LOCAL ERROR] VLC Player not available", "error");
                 return;
             }
 
@@ -296,57 +461,113 @@ namespace WallpaperMusicPlayer
                 _isLoopingVideo = true;
                 _isVideoLoaded = false;
                 _lastVlcRawTime = -1;
-                // Fade effect removed for simplicity in Bitmap mode (can be added via Opacity on Image)
                 VideoImage.Opacity = 1.0;
 
                 lock (_vlcLock)
                 {
-                    using var media = new LibVLCSharp.Shared.Media(_libVLC, path);
-                    media.AddOption(":input-repeat=65535");
-                    media.AddOption(":no-audio");
-                    _vlcPlayer.Play(media);
+                    if (_vlcPlayer != null && !_isDisposing)
+                    {
+                        using var media = new LibVLCSharp.Shared.Media(_libVLC, path);
+                        media.AddOption(":input-repeat=65535");
+                        media.AddOption(":no-audio");
+                        _vlcPlayer.Play(media);
+                    }
                 }
             }
             catch (Exception ex)
             {
-                Log($"[LOCAL ERROR] {ex.Message}", "error");
+                Log($"[LOCAL ERROR] Failed to play local video: {ex.Message}", "error");
                 _isLocalLoopPlaying = false;
             }
         }
 
         protected override void OnClosed(EventArgs e)
         {
+            _isDisposing = true;
+
             try
             {
                 _monitorTimer.Stop();
+                _diagnosticsTimer.Stop();
+                _cacheCleanupTimer.Stop();
+                _youtubeHealthCheckTimer.Stop();
+
                 _searchCts?.Cancel();
-                // Важливо скинути колбеки перед виходом, щоб уникнути крашу
-                _vlcPlayer.SetVideoCallbacks(null, null, null);
-                lock (_vlcLock) { _vlcPlayer.Stop(); _vlcPlayer.Dispose(); }
-                _libVLC.Dispose();
+                _searchCts?.Dispose();
+                _searchCts = null;
+
+                // Спочатку відключаємо VLC callbacks — після цього новий Release() більше не надійде
+                if (_vlcPlayer != null)
+                {
+                    _vlcPlayer.SetVideoCallbacks(null, null, null);
+                }
+
+                // Тепер безпечно чекати завершення поточного BeginInvoke
+                _videoRenderSemaphore.Wait(TimeSpan.FromSeconds(1));
+
+                if (_vlcPlayer != null)
+                {
+                    lock (_vlcLock)
+                    {
+                        _vlcPlayer.Stop();
+                        _vlcPlayer.Dispose();
+                        _vlcPlayer = null;
+                    }
+                }
+
+                _libVLC?.Dispose();
+                _libVLC = null;
+
+                _videoBitmap = null;
+                _videoBuffer = IntPtr.Zero;
+
+                _videoRenderSemaphore.Dispose();
+
+                // Очищення YoutubeWrapper
+                _youtubeWrapper?.Dispose();
+                _youtubeWrapper = null;
+
+                // Очищення старих backup файлів
+                YoutubeDllUpdater.CleanupBackups();
             }
-            catch { }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"Error during cleanup: {ex.Message}");
+            }
+
             base.OnClosed(e);
         }
 
+        private bool _isMonitorLoopRunning = false;
+
         private async void MonitorLoop(object? sender, EventArgs e)
         {
-            UpdateWindowDiagnostics();
-
-            if (_mediaManager == null) return;
-
+            if (_mediaManager == null || _isDisposing) return;
+            if (_isMonitorLoopRunning) return;
+            _isMonitorLoopRunning = true;
             try
             {
                 var session = GetRelevantSession(_mediaManager);
 
                 if (session == null)
                 {
-                    if (!_isLocalLoopPlaying)
+                    if (!_isLocalLoopPlaying && File.Exists(_idleVideoPath))
                     {
                         PlayLocalLoop(_idleVideoPath, "No Session");
                     }
+                    UpdateTimingDisplay(TimeSpan.Zero, TimeSpan.Zero, false, false);
                     return;
                 }
+
+                string currentSessionId = session.SourceAppUserModelId;
+                if (_currentSessionId != currentSessionId && _currentSessionId != null)
+                {
+                    Log($"[SESSION] Changed from {_currentSessionId} to {currentSessionId}", "warning");
+                    _diffHistory.Clear();
+                    _displayDiff = 0;
+                    _syncDiff = 0;
+                }
+                _currentSessionId = currentSessionId;
 
                 var playbackInfo = session.GetPlaybackInfo();
                 bool isMusicPlaying = playbackInfo.PlaybackStatus == GlobalSystemMediaTransportControlsSessionPlaybackStatus.Playing;
@@ -359,9 +580,15 @@ namespace WallpaperMusicPlayer
 
                 if (!isMusicPlaying)
                 {
-                    if (_vlcPlayer.IsPlaying)
+                    if (_vlcPlayer != null && _vlcPlayer.IsPlaying && !_isDisposing)
                     {
-                        lock (_vlcLock) { _vlcPlayer.Pause(); }
+                        lock (_vlcLock)
+                        {
+                            if (_vlcPlayer != null && !_isDisposing)
+                            {
+                                _vlcPlayer.Pause();
+                            }
+                        }
                         Log("[MONITOR] Video Paused", "info");
                     }
                     var timelinePaused = session.GetTimelineProperties();
@@ -370,21 +597,43 @@ namespace WallpaperMusicPlayer
                     return;
                 }
 
-                if (!_vlcPlayer.IsPlaying && _isVideoLoaded)
+                if (_vlcPlayer != null && !_vlcPlayer.IsPlaying && _isVideoLoaded && !_isDisposing)
                 {
-                    lock (_vlcLock) { _vlcPlayer.Play(); }
+                    lock (_vlcLock)
+                    {
+                        if (_vlcPlayer != null && !_isDisposing)
+                        {
+                            _vlcPlayer.Play();
+                        }
+                    }
                 }
 
                 var info = await session.TryGetMediaPropertiesAsync();
                 string artist = info?.Artist ?? "";
                 string title = info?.Title ?? "";
-                string currentSong = (!string.IsNullOrEmpty(artist) || !string.IsNullOrEmpty(title))
-                                     ? $"{artist} - {title}" : "Unknown";
 
-                if (currentSong != "Unknown" && currentSong != _lastSong)
+                string currentSong = "";
+                if (!string.IsNullOrWhiteSpace(artist) && !string.IsNullOrWhiteSpace(title))
+                {
+                    currentSong = $"{artist.Trim()} - {title.Trim()}";
+                }
+                else if (!string.IsNullOrWhiteSpace(title))
+                {
+                    currentSong = title.Trim();
+                }
+                else if (!string.IsNullOrWhiteSpace(artist))
+                {
+                    currentSong = artist.Trim();
+                }
+
+                if (!string.IsNullOrEmpty(currentSong) && currentSong != _lastSong)
                 {
                     _lastSong = currentSong;
-                    PlayLocalLoop(_loadingVideoPath, "Track Switch");
+
+                    if (File.Exists(_loadingVideoPath))
+                    {
+                        PlayLocalLoop(_loadingVideoPath, "Track Switch");
+                    }
 
                     _isVideoLoaded = false;
                     _isLoopingVideo = false;
@@ -394,10 +643,14 @@ namespace WallpaperMusicPlayer
                     _diffHistory.Clear();
 
                     _searchCts?.Cancel();
+                    _searchCts?.Dispose();
                     _searchCts = new CancellationTokenSource();
+                    // Зберігаємо token локально — ProcessSongAsync тримає цей екземпляр,
+                    // а _searchCts може бути замінено до завершення задачі
+                    var token = _searchCts.Token;
 
                     Log($"♪ Next Track: {currentSong}", "info");
-                    _ = ProcessSongAsync(currentSong, _searchCts.Token);
+                    _ = ProcessSongAsync(currentSong, token);
                 }
 
                 if (_isLocalLoopPlaying)
@@ -410,10 +663,17 @@ namespace WallpaperMusicPlayer
 
                 var timeline = session.GetTimelineProperties();
                 TimeSpan liveAudioTime = TimeSpan.Zero;
+
                 if (timeline != null)
                 {
                     liveAudioTime = timeline.Position + (DateTimeOffset.Now - timeline.LastUpdatedTime);
                 }
+                else
+                {
+                    Log("[MONITOR] Timeline unavailable - sync may be inaccurate", "warning");
+                }
+
+                if (_vlcPlayer == null) return;
 
                 long currentRawVlcTime = _vlcPlayer.Time;
                 TimeSpan smoothVlcTime;
@@ -440,10 +700,11 @@ namespace WallpaperMusicPlayer
                         }
                         else
                         {
-                            double safeRate = Math.Min(_vlcPlayer.Rate, 1.05);
+                            double safeRate = Math.Clamp(_vlcPlayer.Rate, 0.5, 1.5);
                             double extrapolatedMs = _lastVlcRawTime + (msPassed * safeRate);
-                            if (_vlcPlayer.Length > 0 && extrapolatedMs > _vlcPlayer.Length) extrapolatedMs = _vlcPlayer.Length;
-                            smoothVlcTime = TimeSpan.FromMilliseconds(extrapolatedMs);
+                            if (_vlcPlayer.Length > 0 && extrapolatedMs > _vlcPlayer.Length)
+                                extrapolatedMs = _vlcPlayer.Length;
+                            smoothVlcTime = TimeSpan.FromMilliseconds(Math.Max(0, extrapolatedMs));
                         }
                     }
                     else
@@ -461,7 +722,14 @@ namespace WallpaperMusicPlayer
             }
             catch (Exception ex)
             {
-                if (ex is not OperationCanceledException) Log($"[MONITOR] Error: {ex.Message}", "error");
+                if (ex is not OperationCanceledException)
+                {
+                    Log($"[MONITOR ERROR] {ex.Message}", "error");
+                }
+            }
+            finally
+            {
+                _isMonitorLoopRunning = false;
             }
         }
 
@@ -469,48 +737,74 @@ namespace WallpaperMusicPlayer
         {
             try
             {
-                _tickCounter++;
+                using var currentProcess = Process.GetCurrentProcess();
+                string pName = currentProcess.ProcessName;
+                var processes = Process.GetProcessesByName(pName);
 
-                // 1. Інформація про процеси (оновлюємо рідше, щоб не вантажити CPU)
-                if (_tickCounter % 10 == 0)
+                try
                 {
-                    var currentProcess = Process.GetCurrentProcess();
-                    string pName = currentProcess.ProcessName;
-                    var processes = Process.GetProcessesByName(pName);
-
                     TxtProcessCount.Text = processes.Length.ToString();
-                    // Якщо процесів > 1, підсвічуємо червоним
                     TxtProcessCount.Foreground = processes.Length > 1 ? Brushes.Red : Brushes.White;
-
                     TxtProcessId.Text = currentProcess.Id.ToString();
                 }
+                finally
+                {
+                    // GetProcessesByName повертає масив IDisposable об'єктів —
+                    // без утилізації це витік дескрипторів (метод викликається щосекунди)
+                    foreach (var p in processes) p.Dispose();
+                }
 
-                // 2. Інформація про вікна
                 var windows = Application.Current.Windows;
                 TxtWindowCount.Text = windows.Count.ToString();
 
-                // В режимі "Single Window" ми очікуємо рівно 1 вікно.
                 if (windows.Count == 1)
-                    TxtWindowCount.Foreground = Brushes.Green; // Ідеально
+                    TxtWindowCount.Foreground = Brushes.Green;
                 else
-                    TxtWindowCount.Foreground = Brushes.Yellow; // Підозріло (але може бути VS)
+                    TxtWindowCount.Foreground = Brushes.Yellow;
 
-                // 3. Детальний стан головного вікна
                 TxtVisibility.Text = this.Visibility.ToString();
-                if (this.Visibility != Visibility.Visible) TxtVisibility.Foreground = Brushes.Red;
-                else TxtVisibility.Foreground = Brushes.White;
+                if (this.Visibility != Visibility.Visible)
+                    TxtVisibility.Foreground = Brushes.Red;
+                else
+                    TxtVisibility.Foreground = Brushes.White;
 
                 TxtWindowState.Text = this.WindowState.ToString();
                 TxtTopmost.Text = this.Topmost.ToString();
 
-                // Реальний розмір вікна
                 TxtRenderSize.Text = $"{this.ActualWidth:F0}x{this.ActualHeight:F0}";
 
-                // Системний Handle
                 var helper = new System.Windows.Interop.WindowInteropHelper(this);
                 TxtHandle.Text = "0x" + helper.Handle.ToString("X8");
             }
-            catch { }
+            catch (Exception ex)
+            {
+                Log($"[DIAGNOSTICS ERROR] {ex.Message}", "error");
+            }
+        }
+
+        private void CleanupExpiredCache()
+        {
+            try
+            {
+                var now = DateTime.Now;
+                var expiredKeys = _smartCache.Where(kv => kv.Value.ExpiryTime < now)
+                                             .Select(kv => kv.Key)
+                                             .ToList();
+
+                foreach (var key in expiredKeys)
+                {
+                    _smartCache.TryRemove(key, out _);
+                }
+
+                if (expiredKeys.Count > 0)
+                {
+                    Log($"[CACHE] Cleaned {expiredKeys.Count} expired entries", "info");
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"[CACHE ERROR] Cleanup failed: {ex.Message}", "error");
+            }
         }
 
         private GlobalSystemMediaTransportControlsSession? GetRelevantSession(GlobalSystemMediaTransportControlsSessionManager manager)
@@ -526,26 +820,47 @@ namespace WallpaperMusicPlayer
                         if (info != null && info.PlaybackStatus == GlobalSystemMediaTransportControlsSessionPlaybackStatus.Playing)
                             return session;
                     }
-                    catch { continue; }
+                    catch (Exception ex)
+                    {
+                        Log($"[SESSION ERROR] Failed to get session info: {ex.Message}", "error");
+                        continue;
+                    }
                 }
-                return manager.GetCurrentSession();
+                // Повертаємо null якщо жодна сесія не грає.
+                // Раніше тут було GetCurrentSession() — це спричиняло зайві пошуки
+                // на YouTube для треку що зараз не відтворюється.
+                return null;
             }
-            catch { return null; }
+            catch (Exception ex)
+            {
+                Log($"[SESSION ERROR] Failed to get sessions: {ex.Message}", "error");
+                return null;
+            }
         }
 
         private void SyncVideoState(TimeSpan targetAudio, TimeSpan currentVideo)
         {
-            if (_isLoopingVideo || _isLocalLoopPlaying) return;
+            if (_isLoopingVideo || _isLocalLoopPlaying || _vlcPlayer == null || _isDisposing)
+                return;
 
-            if ((DateTime.Now - _lastSeekTime).TotalSeconds < 1.0) return;
+            if ((DateTime.Now - _lastSeekTime).TotalSeconds < 1.0)
+                return;
 
             try
             {
                 double instantDiff = (targetAudio - currentVideo).TotalSeconds;
-                if (double.IsNaN(instantDiff) || double.IsInfinity(instantDiff)) return;
+                if (double.IsNaN(instantDiff) || double.IsInfinity(instantDiff))
+                    return;
+
+                if (Math.Abs(instantDiff) > 300)
+                {
+                    Log($"[SYNC WARNING] Extreme diff detected: {instantDiff:F2}s - ignoring", "warning");
+                    return;
+                }
 
                 _diffHistory.Enqueue(instantDiff);
-                if (_diffHistory.Count > 5) _diffHistory.Dequeue();
+                if (_diffHistory.Count > 5)
+                    _diffHistory.Dequeue();
 
                 var sortedDiffs = _diffHistory.OrderBy(x => x).ToList();
                 double medianDiff = sortedDiffs[sortedDiffs.Count / 2];
@@ -553,31 +868,46 @@ namespace WallpaperMusicPlayer
                 _displayDiff = (_displayDiff * 0.75) + (medianDiff * 0.25);
                 _syncDiff = (_syncDiff * 0.4) + (medianDiff * 0.6);
 
-                TxtDiff.Text = $"{_displayDiff:+0.00;-0.00;0.00}s";
+                // TxtDiff оновлюється виключно через UpdateTimingDisplay в MonitorLoop,
+                // щоб уникнути подвійного запису в один UI-елемент за один цикл.
                 double absDiff = Math.Abs(_syncDiff);
 
                 if (absDiff > 3.0)
                 {
-                    long targetMs = (long)targetAudio.TotalMilliseconds;
+                    long targetMs = (long)Math.Clamp(targetAudio.TotalMilliseconds, 0, long.MaxValue);
                     if (_vlcPlayer.Length > 0 && targetMs >= 0 && targetMs < _vlcPlayer.Length)
                     {
-                        lock (_vlcLock) { _vlcPlayer.Time = targetMs; _vlcPlayer.SetRate(1.0f); }
+                        lock (_vlcLock)
+                        {
+                            if (_vlcPlayer != null && !_isDisposing)
+                            {
+                                _vlcPlayer.Time = targetMs;
+                                _vlcPlayer.SetRate(1.0f);
+                            }
+                        }
                         _lastSeekTime = DateTime.Now;
                         _lastVlcRawTime = targetMs;
                         _lastVlcUpdateTime = DateTime.Now;
                         _syncDiff = 0;
                         _displayDiff = 0;
                         _diffHistory.Clear();
+                        Log($"[SYNC] Hard seek to {TimeSpan.FromMilliseconds(targetMs):mm\\:ss}", "info");
                     }
                     return;
                 }
 
                 if (absDiff > 1.5 && absDiff <= 3.0)
                 {
-                    long targetMs = (long)targetAudio.TotalMilliseconds;
+                    long targetMs = (long)Math.Clamp(targetAudio.TotalMilliseconds, 0, long.MaxValue);
                     if (_vlcPlayer.Length > 0 && targetMs >= 0 && targetMs < _vlcPlayer.Length)
                     {
-                        lock (_vlcLock) { _vlcPlayer.Time = targetMs; }
+                        lock (_vlcLock)
+                        {
+                            if (_vlcPlayer != null && !_isDisposing)
+                            {
+                                _vlcPlayer.Time = targetMs;
+                            }
+                        }
                         _lastSeekTime = DateTime.Now;
                         _lastVlcRawTime = targetMs;
                         _lastVlcUpdateTime = DateTime.Now;
@@ -589,7 +919,16 @@ namespace WallpaperMusicPlayer
 
                 if (absDiff < 0.05)
                 {
-                    if (Math.Abs(_vlcPlayer.Rate - 1.0f) > 0.005f) lock (_vlcLock) { _vlcPlayer.SetRate(1.0f); }
+                    if (Math.Abs(_vlcPlayer.Rate - 1.0f) > 0.005f)
+                    {
+                        lock (_vlcLock)
+                        {
+                            if (_vlcPlayer != null && !_isDisposing)
+                            {
+                                _vlcPlayer.SetRate(1.0f);
+                            }
+                        }
+                    }
                     return;
                 }
 
@@ -609,120 +948,332 @@ namespace WallpaperMusicPlayer
                     else targetRate = 0.99f;
                 }
 
-                if (Math.Abs(_vlcPlayer.Rate - targetRate) > 0.003f) lock (_vlcLock) { _vlcPlayer.SetRate(targetRate); }
+                if (Math.Abs(_vlcPlayer.Rate - targetRate) > 0.003f)
+                {
+                    lock (_vlcLock)
+                    {
+                        if (_vlcPlayer != null && !_isDisposing)
+                        {
+                            _vlcPlayer.SetRate(targetRate);
+                        }
+                    }
+                }
             }
-            catch { }
+            catch (Exception ex)
+            {
+                Log($"[SYNC ERROR] {ex.Message}", "error");
+            }
+        }
+
+        private bool CheckYouTubeRateLimit()
+        {
+            var now = DateTime.Now;
+
+            if ((now - _lastYoutubeRequest).TotalMinutes >= 1)
+            {
+                _youtubeRequestCount = 0;
+                _lastYoutubeRequest = now;
+            }
+
+            if (_youtubeRequestCount >= MAX_YOUTUBE_REQUESTS_PER_MINUTE)
+            {
+                Log($"[RATE LIMIT] YouTube requests throttled ({_youtubeRequestCount}/min)", "warning");
+                return false;
+            }
+
+            _youtubeRequestCount++;
+            _lastYoutubeRequest = now;
+            return true;
+        }
+
+        private async Task<bool> WaitForInternetConnection(CancellationToken token)
+        {
+            for (int i = 0; i < 3; i++)
+            {
+                if (System.Net.NetworkInformation.NetworkInterface.GetIsNetworkAvailable())
+                {
+                    return true;
+                }
+
+                Log($"[NETWORK] No internet connection, retrying... ({i + 1}/3)", "warning");
+                await Task.Delay(2000, token);
+            }
+
+            return false;
         }
 
         private async Task ProcessSongAsync(string query, CancellationToken token)
         {
             try
             {
+                if (!await WaitForInternetConnection(token))
+                {
+                    Log("[NETWORK ERROR] No internet connection available", "error");
+                    if (File.Exists(_loadingVideoPath))
+                    {
+                        await Dispatcher.InvokeAsync(() => PlayLocalLoop(_loadingVideoPath, "No Internet"));
+                    }
+                    return;
+                }
+
+                if (_youtubeWrapper == null || !_youtubeWrapper.IsLoaded)
+                {
+                    Log("[YOUTUBE ERROR] YouTube wrapper not available", "error");
+
+                    // Спроба автооновлення
+                    await CheckYoutubeHealthAsync();
+
+                    if (_youtubeWrapper == null || !_youtubeWrapper.IsLoaded)
+                    {
+                        if (File.Exists(_loadingVideoPath))
+                        {
+                            await Dispatcher.InvokeAsync(() => PlayLocalLoop(_loadingVideoPath, "YouTube Unavailable"));
+                        }
+                        return;
+                    }
+                }
+
+                if (!CheckYouTubeRateLimit())
+                {
+                    Log("[RATE LIMIT] Waiting 1 minute before retrying...", "warning");
+                    await Task.Delay(TimeSpan.FromMinutes(1), token);
+                    if (token.IsCancellationRequested) return;
+
+                    if (!CheckYouTubeRateLimit())
+                    {
+                        Log("[RATE LIMIT] Still throttled after wait, skipping track", "warning");
+                        return;
+                    }
+                }
+
                 string videoId = "";
                 string streamUrl = "";
 
-                lock (_cacheLock)
+                if (_smartCache.TryGetValue(query, out var cachedData))
                 {
-                    if (_smartCache.TryGetValue(query, out var cachedData))
+                    if (DateTime.Now < cachedData.ExpiryTime)
                     {
-                        if (DateTime.Now < cachedData.ExpiryTime)
-                        {
-                            Log($"[CACHE] Fast load: {cachedData.VideoId}", "success");
-                            PlayVideo(cachedData.StreamUrl);
-                            return;
-                        }
-                        else videoId = cachedData.VideoId;
+                        Log($"[CACHE HIT] {cachedData.VideoId}", "success");
+                        await Dispatcher.InvokeAsync(() => PlayVideo(cachedData.StreamUrl));
+                        return;
+                    }
+                    else
+                    {
+                        videoId = cachedData.VideoId;
+                        _smartCache.TryRemove(query, out _);
+                        Log($"[CACHE] Expired entry removed for: {query}", "info");
                     }
                 }
 
                 if (string.IsNullOrEmpty(videoId))
                 {
-                    var searchResults = await _youtube.Search.GetVideosAsync(query, token).CollectAsync(1);
-                    if (searchResults.Count > 0) videoId = searchResults[0].Id.Value;
-                    else
+                    using var searchCts = CancellationTokenSource.CreateLinkedTokenSource(token);
+                    searchCts.CancelAfter(TimeSpan.FromSeconds(NETWORK_TIMEOUT_SECONDS));
+
+                    try
                     {
-                        Log($"[SEARCH] No results: {query}", "warning");
+                        Log($"[SEARCH] Searching for: '{query}'", "info");
+                        var searchResults = await _youtubeWrapper.SearchVideosAsync(query, 1, searchCts.Token);
+
+                        if (searchResults.Count > 0)
+                        {
+                            videoId = searchResults[0].VideoId;
+                            Log($"[SEARCH] Found: {videoId} - '{searchResults[0].Title}' by {searchResults[0].Author}", "success");
+                        }
+                        else
+                        {
+                            Log($"[SEARCH] No results for: {query}", "warning");
+                            return;
+                        }
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        Log($"[SEARCH TIMEOUT] Request timed out after {NETWORK_TIMEOUT_SECONDS}s", "warning");
+                        return;
+                    }
+                    catch (Exception ex)
+                    {
+                        // ДЕТАЛЬНЕ ЛОГУВАННЯ ПОМИЛКИ
+                        string errorDetails = $"{ex.GetType().Name}: {ex.Message}";
+
+                        if (ex.InnerException != null)
+                        {
+                            errorDetails += $"\n    Inner: {ex.InnerException.GetType().Name}: {ex.InnerException.Message}";
+                        }
+
+                        // Витягуємо перший рядок stack trace
+                        if (!string.IsNullOrEmpty(ex.StackTrace))
+                        {
+                            var stackLines = ex.StackTrace.Split('\n', StringSplitOptions.RemoveEmptyEntries);
+                            if (stackLines.Length > 0)
+                            {
+                                errorDetails += $"\n    At: {stackLines[0].Trim()}";
+                            }
+                        }
+
+                        Log($"[SEARCH ERROR] {errorDetails}", "error");
+
+                        // Можливо YouTube API зламався - перевіряємо
+                        _ = Task.Run(() => CheckYoutubeHealthAsync());
                         return;
                     }
                 }
 
-                if (token.IsCancellationRequested || string.IsNullOrEmpty(videoId)) return;
+                if (token.IsCancellationRequested || string.IsNullOrEmpty(videoId))
+                    return;
 
                 try
                 {
-                    var manifest = await _youtube.Videos.Streams.GetManifestAsync(videoId, token);
-                    var videoStream = manifest.GetVideoOnlyStreams()
-                        .Where(s => s.Container == Container.Mp4 && s.VideoQuality.MaxHeight <= 1080)
-                        .OrderByDescending(s => s.VideoQuality.MaxHeight)
-                        .FirstOrDefault();
+                    using var manifestCts = CancellationTokenSource.CreateLinkedTokenSource(token);
+                    manifestCts.CancelAfter(TimeSpan.FromSeconds(NETWORK_TIMEOUT_SECONDS));
 
-                    if (videoStream != null)
+                    Log($"[STREAM] Getting stream URL for: {videoId}", "info");
+                    var streamInfo = await _youtubeWrapper.GetVideoStreamAsync(videoId, manifestCts.Token);
+
+                    if (streamInfo != null)
                     {
-                        streamUrl = videoStream.Url;
-                        lock (_cacheLock)
+                        streamUrl = streamInfo.Url;
+
+                        _smartCache[query] = new CachedVideo
                         {
-                            _smartCache[query] = new CachedVideo
-                            {
-                                VideoId = videoId,
-                                StreamUrl = streamUrl,
-                                ExpiryTime = DateTime.Now.AddHours(5)
-                            };
-                            if (_smartCache.Count > 100)
-                                _smartCache.Remove(_smartCache.OrderBy(kv => kv.Value.ExpiryTime).First().Key);
+                            VideoId = videoId,
+                            StreamUrl = streamUrl,
+                            ExpiryTime = DateTime.Now.AddHours(YOUTUBE_CACHE_HOURS)
+                        };
+
+                        while (_smartCache.Count > MAX_CACHE_SIZE)
+                        {
+                            var oldestKey = _smartCache.OrderBy(kv => kv.Value.ExpiryTime).First().Key;
+                            _smartCache.TryRemove(oldestKey, out _);
                         }
+
+                        Log($"[STREAM] Quality: {streamInfo.Quality}, Container: {streamInfo.Container}, Height: {streamInfo.Height}p", "info");
                     }
                     else
                     {
-                        Log($"[ERROR] Stream not found for: {videoId}", "error");
+                        Log($"[ERROR] No suitable stream found for: {videoId}", "error");
                         return;
                     }
                 }
+                catch (OperationCanceledException)
+                {
+                    Log($"[TIMEOUT] Manifest request timed out after {NETWORK_TIMEOUT_SECONDS}s", "warning");
+                    return;
+                }
                 catch (Exception ex)
                 {
-                    Log($"[ERROR] Manifest: {ex.Message}", "error");
-                    lock (_cacheLock) { _smartCache.Remove(query); }
+                    // ДЕТАЛЬНЕ ЛОГУВАННЯ ПОМИЛКИ MANIFEST
+                    string errorDetails = $"{ex.GetType().Name}: {ex.Message}";
+
+                    if (ex.InnerException != null)
+                    {
+                        errorDetails += $"\n    Inner: {ex.InnerException.GetType().Name}: {ex.InnerException.Message}";
+                    }
+
+                    if (!string.IsNullOrEmpty(ex.StackTrace))
+                    {
+                        var stackLines = ex.StackTrace.Split('\n', StringSplitOptions.RemoveEmptyEntries);
+                        if (stackLines.Length > 0)
+                        {
+                            errorDetails += $"\n    At: {stackLines[0].Trim()}";
+                        }
+                    }
+
+                    Log($"[MANIFEST ERROR] {errorDetails}", "error");
+                    _smartCache.TryRemove(query, out _);
+
+                    // Можливо YouTube API зламався
+                    _ = Task.Run(() => CheckYoutubeHealthAsync());
                     return;
                 }
 
-                if (token.IsCancellationRequested) return;
+                if (token.IsCancellationRequested)
+                    return;
 
                 if (!string.IsNullOrEmpty(streamUrl))
                 {
-                    Log("[DEBUG] Starting playback...", "info");
-                    PlayVideo(streamUrl);
+                    if (Uri.TryCreate(streamUrl, UriKind.Absolute, out var validatedUri))
+                    {
+                        Log("[PLAYBACK] Starting video playback...", "info");
+                        await Dispatcher.InvokeAsync(() => PlayVideo(streamUrl));
+                    }
+                    else
+                    {
+                        Log($"[ERROR] Invalid stream URL: {streamUrl}", "error");
+                        _smartCache.TryRemove(query, out _);
+                    }
                 }
             }
-            catch (OperationCanceledException) { Log("[SEARCH] Cancelled", "info"); }
-            catch (Exception ex) { Log($"[FATAL] {ex.Message}", "error"); }
+            catch (OperationCanceledException)
+            {
+                Log("[SEARCH] Operation cancelled", "info");
+            }
+            catch (Exception ex)
+            {
+                // ДЕТАЛЬНЕ ЛОГУВАННЯ КРИТИЧНИХ ПОМИЛОК
+                string errorDetails = $"{ex.GetType().Name}: {ex.Message}";
+
+                if (ex.InnerException != null)
+                {
+                    errorDetails += $"\n    Inner: {ex.InnerException.GetType().Name}: {ex.InnerException.Message}";
+                }
+
+                if (!string.IsNullOrEmpty(ex.StackTrace))
+                {
+                    var stackLines = ex.StackTrace.Split('\n', StringSplitOptions.RemoveEmptyEntries);
+                    if (stackLines.Length > 0)
+                    {
+                        errorDetails += $"\n    At: {stackLines[0].Trim()}";
+                    }
+                }
+
+                Log($"[FATAL ERROR] ProcessSong:\n{errorDetails}", "error");
+            }
         }
 
         private void PlayVideo(string url)
         {
+            if (_vlcPlayer == null || _isDisposing)
+            {
+                Log("[PLAYBACK ERROR] VLC Player not available", "error");
+                return;
+            }
+
             try
             {
                 _isLocalLoopPlaying = false;
                 _isVideoLoaded = false;
                 _isLoopingVideo = false;
                 _lastVlcRawTime = -1;
-                // Fade effect not implemented in Bitmap mode to keep it simple
                 VideoImage.Opacity = 1.0;
 
-                var media = new LibVLCSharp.Shared.Media(_libVLC, new Uri(url));
-                media.AddOption(":network-caching=300");
+                using var media = new LibVLCSharp.Shared.Media(_libVLC, new Uri(url));
+                media.AddOption(":network-caching=1000");
                 media.AddOption(":clock-jitter=0");
                 media.AddOption(":clock-synchro=0");
                 media.AddOption(":avcodec-hw=any");
                 media.AddOption(":input-repeat=65535");
                 media.AddOption(":no-audio");
 
-                Log("[VLC] Fast Play triggered...", "info");
+                Log("[VLC] Starting playback with optimized settings", "info");
 
-                lock (_vlcLock) { _vlcPlayer.Play(media); }
+                lock (_vlcLock)
+                {
+                    if (_vlcPlayer != null && !_isDisposing)
+                    {
+                        _vlcPlayer.Play(media);
+                    }
+                }
             }
             catch (Exception ex)
             {
-                Log($"[VLC ERROR] {ex.Message}", "error");
+                Log($"[VLC ERROR] Playback failed: {ex.Message}", "error");
                 _isVideoLoaded = false;
+
+                if (File.Exists(_loadingVideoPath))
+                {
+                    PlayLocalLoop(_loadingVideoPath, "Playback Error Recovery");
+                }
             }
         }
 
@@ -734,9 +1285,12 @@ namespace WallpaperMusicPlayer
             TxtAudioTime.Text = audio.ToString(@"mm\:ss\.f");
             TxtVideoTime.Text = video.ToString(@"mm\:ss\.f");
 
-            if (vlcUpdated && _isVideoLoaded) TxtVideoTime.Foreground = new SolidColorBrush(Color.FromRgb(80, 250, 123));
-            else if (_isVideoLoaded) TxtVideoTime.Foreground = new SolidColorBrush(Color.FromRgb(139, 233, 253));
-            else TxtVideoTime.Foreground = Brushes.Gray;
+            if (vlcUpdated && _isVideoLoaded)
+                TxtVideoTime.Foreground = new SolidColorBrush(Color.FromRgb(80, 250, 123));
+            else if (_isVideoLoaded)
+                TxtVideoTime.Foreground = new SolidColorBrush(Color.FromRgb(139, 233, 253));
+            else
+                TxtVideoTime.Foreground = Brushes.Gray;
 
             if (!isPlaying)
             {
@@ -751,14 +1305,24 @@ namespace WallpaperMusicPlayer
             if (!_isLoopingVideo)
             {
                 double diff = _displayDiff;
-                if (double.IsNaN(diff)) { TxtDiff.Text = "---"; TxtDiff.Foreground = Brushes.Gray; return; }
+                if (double.IsNaN(diff))
+                {
+                    TxtDiff.Text = "---";
+                    TxtDiff.Foreground = Brushes.Gray;
+                    return;
+                }
 
                 TxtDiff.Text = $"{diff:+0.00;-0.00;0.00}s";
                 double absDiff = Math.Abs(diff);
-                if (absDiff < 0.3) TxtDiff.Foreground = new SolidColorBrush(Color.FromRgb(80, 250, 123));
-                else if (absDiff < 1.0) TxtDiff.Foreground = new SolidColorBrush(Color.FromRgb(255, 184, 108));
-                else if (absDiff < 2.0) TxtDiff.Foreground = new SolidColorBrush(Color.FromRgb(255, 121, 198));
-                else TxtDiff.Foreground = new SolidColorBrush(Color.FromRgb(255, 85, 85));
+
+                if (absDiff < 0.3)
+                    TxtDiff.Foreground = new SolidColorBrush(Color.FromRgb(80, 250, 123));
+                else if (absDiff < 1.0)
+                    TxtDiff.Foreground = new SolidColorBrush(Color.FromRgb(255, 184, 108));
+                else if (absDiff < 2.0)
+                    TxtDiff.Foreground = new SolidColorBrush(Color.FromRgb(255, 121, 198));
+                else
+                    TxtDiff.Foreground = new SolidColorBrush(Color.FromRgb(255, 85, 85));
             }
             else
             {
@@ -771,15 +1335,30 @@ namespace WallpaperMusicPlayer
         {
             try
             {
-                string timeStr = DateTime.Now.ToString("HH:mm:ss");
-                Task.Run(() => { try { File.AppendAllText(_logPath, $"[{timeStr}] {message}{Environment.NewLine}"); } catch { } });
+                string timeStr = DateTime.Now.ToString("HH:mm:ss.fff");
 
-                Dispatcher.Invoke(() =>
+                Task.Run(() =>
+                {
+                    try
+                    {
+                        lock (_logFileLock)
+                        {
+                            File.AppendAllText(_logPath, $"[{timeStr}] {message}{Environment.NewLine}");
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Debug.WriteLine($"Failed to write log: {ex.Message}");
+                    }
+                });
+
+                Dispatcher.BeginInvoke(() =>
                 {
                     try
                     {
                         var paragraph = new Paragraph { Margin = new Thickness(0) };
                         paragraph.Inlines.Add(new Run($"[{timeStr}] ") { Foreground = Brushes.Gray });
+
                         var runMsg = new Run(message);
                         runMsg.Foreground = type switch
                         {
@@ -788,15 +1367,27 @@ namespace WallpaperMusicPlayer
                             "warning" => new SolidColorBrush(Color.FromRgb(255, 184, 108)),
                             _ => new SolidColorBrush(Color.FromRgb(139, 233, 253))
                         };
+
                         paragraph.Inlines.Add(runMsg);
                         LogOutput.Document.Blocks.Add(paragraph);
-                        if (LogOutput.Document.Blocks.Count > 100) LogOutput.Document.Blocks.Remove(LogOutput.Document.Blocks.FirstBlock);
+
+                        while (LogOutput.Document.Blocks.Count > 100)
+                        {
+                            LogOutput.Document.Blocks.Remove(LogOutput.Document.Blocks.FirstBlock);
+                        }
+
                         LogOutput.ScrollToEnd();
                     }
-                    catch { }
-                });
+                    catch (Exception ex)
+                    {
+                        Debug.WriteLine($"Failed to display log: {ex.Message}");
+                    }
+                }, DispatcherPriority.Background);
             }
-            catch { }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"Log method failed: {ex.Message}");
+            }
         }
     }
 }

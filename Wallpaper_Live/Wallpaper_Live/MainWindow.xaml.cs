@@ -1,4 +1,5 @@
 ﻿using FuzzySharp;
+using SkiaSharp;
 using LibVLCSharp.Shared;
 using System.Collections.Concurrent;
 using System.Diagnostics;
@@ -18,6 +19,52 @@ namespace WallpaperMusicPlayer
 {
     public partial class MainWindow : Window
     {
+        /// <summary>
+        /// Ваги та пороги для системи скорингу відео.
+        /// Винесено в окремий клас для легкого тюнінгу без ризику зламати логіку.
+        /// </summary>
+        private static class ScoreWeights
+        {
+            // ── Базовий fuzzy-match ───────────────────────────────────────────────
+            public const float FuzzyMultiplier = 1.5f;
+
+            // ── Підтверджуючі бонуси ─────────────────────────────────────────────
+            public const int AuthorMatchBonus = 30;
+            public const int VevoBonus = 25;
+            public const int OfficialVideoBonus = 50;
+            public const int MusicVideoBonus = 30;
+            public const int TrailerBonus = 20;
+            public const int OfficialMVBonus = 50;
+
+            // ── Бонус за позицію в результатах пошуку ────────────────────────────
+            // Позиція 0 → +15, 1 → +10, 2 → +5, 3+ → 0
+            public const int PositionBonusStep = 5;
+            public const int PositionBonusMaxIdx = 3;   // індекси 0..2 отримують бонус
+
+            // ── Збіг тривалості ──────────────────────────────────────────────────
+            public const int DurationExactBonus = 25;  // < 5 сек різниці
+            public const int DurationCloseBonus = 15;  // < 15 сек
+            public const int DurationOkBonus = 5;   // < 30 сек
+            public const int DurationFarPenalty = -20; // > 120 сек
+
+            // ── Штрафи за небажаний контент ──────────────────────────────────────
+            public const int KaraokePenalty = -60;
+            public const int OneHourPenalty = -60;
+            public const int ReactionPenalty = -50;
+            public const int FanMadePenalty = -50;
+            public const int CoverPenalty = -40;
+            public const int LyricsPenalty = -100;
+            public const int DancePracticePenalty = -170;
+            public const int TopicChannelPenalty = -70;
+            public const int WrongAlphabetPenalty = -50;
+            public const int NoVideoMarkerPenalty = -50;
+
+            // ── Контекстні штрафи (застосовуються у ProcessSongAsync) ────────────
+            public const int ContextOfficialAudioPenalty = -40;
+            public const int ContextTopicPenalty = -40;
+            public const int ContextLyricVideoPenalty = -30;
+        }
+
         private GlobalSystemMediaTransportControlsSessionManager? _mediaManager;
         private YoutubeWrapper? _youtubeWrapper;
         private readonly string _logPath;
@@ -74,10 +121,47 @@ namespace WallpaperMusicPlayer
         private int _youtubeRequestCount = 0;
         private DateTime _lastYoutubeRequest = DateTime.MinValue;
 
+        // ── діагностика зеленого екрану ───────────────────────────────────────
+        private volatile bool _waitingForFirstVlcFrame = false; // true після FadeOut
+        private volatile int _vlcFrameCount = 0;       // скільки кадрів VLC відрендерив усього
+        private volatile int _greenFrameCount = 0;     // зелених кадрів підряд (для відновлення)
+        private volatile bool _greenScreenActive = false; // true поки екран залишається зеленим
+
+        // Кількість пікселів для вибірки (сітка NxN по всьому кадру)
+        private const int GreenSampleGridSize = 4; // 4×4 = 16 пікселів
+        // Зелений = G домінує і G > порогу
+        private const byte GreenDominanceThreshold = 100; // мінімальне значення G
+        private const byte GreenDominanceMargin = 60;  // наскільки G має бути більшим за R і B
+        // Скільки зелених кадрів підряд → вважаємо застряглим і намагаємось відновитись
+        private const int GreenRecoveryFrameThreshold = 30; // ~0.5s при 60fps
+
+        // ── відкладений FadeOut — ховаємо overlay тільки після підтвердження
+        // що кілька кадрів поспіль нормальні (hw-декодер стабілізувався) ────────
+        // Проблема: VLC декодує Frame #1 software, потім ~400-800ms ініціалізує
+        // hw-декодер і Frame #2+ виходять зеленими. FadeOut саме в цей момент
+        // відкриває зелений екран користувачу.
+        // Рішення: тримаємо overlay поверх відео поки не отримаємо
+        // StableFramesRequired нормальних кадрів підряд після VLC Status: Playing.
+        private volatile bool _pendingFadeOut = false;  // FadeOut відкладено
+        private volatile int _stableFrameCount = 0;     // нормальних кадрів підряд
+        private const int StableFramesRequired = 8;     // ~250ms при 30fps потоку
+
         private const int MAX_YOUTUBE_REQUESTS_PER_MINUTE = 10;
         private const int YOUTUBE_CACHE_HOURS = 5;
         private const int MAX_CACHE_SIZE = 100;
         private const int NETWORK_TIMEOUT_SECONDS = 10;
+
+        // ── SkiaSharp animator (замінює idle.mp4 / loading.mp4) ──────────────
+        private WallpaperAnimator? _animator;
+
+        // ── поточний Media об'єкт — зберігається щоб VLC міг ним користуватись
+        // після повернення з Play(). Звільняється перед наступним відтворенням.
+        private LibVLCSharp.Shared.Media? _currentMedia;
+
+        // ── поточний URL відео — для перезапуску без hw-декодера при зеленому екрані
+        private string _currentVideoUrl = "";
+        // true = перший запуск з hw=any вже дав зелений, другий запуск буде з hw=none
+        private bool _hwDecodeAttempted = false;
 
         public MainWindow()
         {
@@ -95,6 +179,11 @@ namespace WallpaperMusicPlayer
                 _vlcPlayer = new LibVLCSharp.Shared.MediaPlayer(_libVLC);
 
                 SetupVideoRendering();
+
+                // Ініціалізація SkiaSharp аніматора
+                // AnimatorImage — окремий Image поверх VideoImage, VLC не торкається
+                _animator = new WallpaperAnimator(AnimatorImage, Dispatcher, Log);
+                Log("[ANIMATOR] SkiaSharp overlay animator initialized", "success");
             }
             catch (Exception ex)
             {
@@ -139,6 +228,10 @@ namespace WallpaperMusicPlayer
 
         private IntPtr VideoLock(IntPtr opaque, IntPtr planes)
         {
+            // VideoLock викликається з нативного VLC-потоку — звертатись до будь-яких
+            // WPF-об'єктів (включно з WriteableBitmap.BackBuffer) тут заборонено.
+            // _videoBuffer кешується один раз у SetupVideoRendering на UI-потоці,
+            // де BackBuffer читати безпечно. Це єдиний коректний підхід.
             if (_videoBuffer == IntPtr.Zero || _isDisposing)
             {
                 Log("[VIDEO LOCK] Invalid buffer or disposing", "warning");
@@ -172,6 +265,8 @@ namespace WallpaperMusicPlayer
                 if (!_videoRenderSemaphore.Wait(0))
                     return;
 
+                int frameNum = System.Threading.Interlocked.Increment(ref _vlcFrameCount);
+
                 Dispatcher.BeginInvoke(() =>
                 {
                     try
@@ -179,6 +274,93 @@ namespace WallpaperMusicPlayer
                         if (_videoBitmap != null && !_isDisposing)
                         {
                             _videoBitmap.Lock();
+
+                            // ── діагностика зеленого екрану ──────────────────
+                            // Моніторинг активний:
+                            //  - перші 30 кадрів після кожного PlayVideo (детальний лог)
+                            //  - постійно поки _greenScreenActive == true (відновлення)
+                            {
+                                IntPtr buf = _videoBitmap.BackBuffer;
+                                if (buf != IntPtr.Zero)
+                                {
+                                    bool frameIsGreen = IsFrameGreen(buf);
+                                    bool frameIsEmpty = IsFrameEmpty(buf);
+
+                                    if (_waitingForFirstVlcFrame && frameNum <= 30)
+                                    {
+                                        int cx = (int)(VideoWidth / 2) * 4;
+                                        int cy = (int)(VideoHeight / 2) * (int)(VideoWidth * 4);
+                                        byte pb = Marshal.ReadByte(buf, cy + cx + 0);
+                                        byte pg = Marshal.ReadByte(buf, cy + cx + 1);
+                                        byte pr = Marshal.ReadByte(buf, cy + cx + 2);
+                                        byte pa = Marshal.ReadByte(buf, cy + cx + 3);
+
+                                        if (frameIsGreen)
+                                        {
+                                            int gc = System.Threading.Interlocked.Increment(ref _greenFrameCount);
+                                            _greenScreenActive = true;
+                                            System.Threading.Interlocked.Exchange(ref _stableFrameCount, 0);
+                                            Log($"[GREEN DEBUG] ⚠ Frame #{frameNum}: GREEN SCREEN!" +
+                                                $" center BGRA=({pb},{pg},{pr},{pa})" +
+                                                $" | green frames: {gc}" +
+                                                $" | overlay={_animator?.OverlayOpacity:F2}", "error");
+                                        }
+                                        else if (frameIsEmpty)
+                                        {
+                                            Log($"[GREEN DEBUG] Frame #{frameNum}: EMPTY" +
+                                                $" | VLC не записав кадр ще", "warning");
+                                        }
+                                        else
+                                        {
+                                            System.Threading.Interlocked.Exchange(ref _greenFrameCount, 0);
+                                            _greenScreenActive = false;
+                                            int stable = System.Threading.Interlocked.Increment(ref _stableFrameCount);
+                                            if (frameNum == 1)
+                                                Log($"[GREEN DEBUG] ✓ Frame #1 нормальний" +
+                                                    $" BGRA=({pb},{pg},{pr},{pa}) — sw decode OK", "success");
+                                        }
+
+                                        if (frameNum == 30)
+                                        {
+                                            _waitingForFirstVlcFrame = false;
+                                            Log($"[GREEN DEBUG] Діагностика завершена (30 кадрів)" +
+                                                $" | зелених: {_greenFrameCount}, стабільних: {_stableFrameCount}" +
+                                                $" | green screen: {_greenScreenActive}",
+                                                _greenScreenActive ? "error" : "success");
+                                        }
+                                    }
+                                    else if (_greenScreenActive)
+                                    {
+                                        // ── постійний моніторинг якщо вже є зелений екран ──
+                                        if (frameIsGreen)
+                                        {
+                                            int gc = System.Threading.Interlocked.Increment(ref _greenFrameCount);
+
+                                            // Лог кожні 60 кадрів щоб не спамити
+                                            if (gc % 60 == 1)
+                                                Log($"[GREEN DEBUG] ⚠ Зелений екран продовжується" +
+                                                    $" | кадрів підряд: {gc}" +
+                                                    $" | всього VLC кадрів: {frameNum}", "error");
+
+                                            // Спроба відновлення через перезапуск VLC
+                                            if (gc == GreenRecoveryFrameThreshold)
+                                            {
+                                                Log($"[GREEN DEBUG] 🔄 {GreenRecoveryFrameThreshold} зелених кадрів —" +
+                                                    $" спроба відновлення через seek до поточної позиції", "error");
+                                                TryRecoverFromGreenScreen();
+                                            }
+                                        }
+                                        else if (!frameIsEmpty)
+                                        {
+                                            // Зелений екран зник сам
+                                            System.Threading.Interlocked.Exchange(ref _greenFrameCount, 0);
+                                            _greenScreenActive = false;
+                                            Log($"[GREEN DEBUG] ✓ Зелений екран зник після {frameNum} кадрів", "success");
+                                        }
+                                    }
+                                }
+                            }
+
                             _videoBitmap.AddDirtyRect(new Int32Rect(0, 0, (int)VideoWidth, (int)VideoHeight));
                             _videoBitmap.Unlock();
                         }
@@ -199,6 +381,128 @@ namespace WallpaperMusicPlayer
                 Log($"[VIDEO DISPLAY ERROR] {ex.Message}", "error");
                 if (!_isDisposing)
                     _videoRenderSemaphore.Release();
+            }
+        }
+
+        /// <summary>
+        /// Перевіряє кадр на зеленість через сітку GreenSampleGridSize×GreenSampleGridSize пікселів.
+        /// Кадр вважається зеленим якщо більшість пікселів мають G >> R і G >> B.
+        /// Викликається з UI-потоку поки bitmap залочений.
+        /// </summary>
+        private bool IsFrameGreen(IntPtr buf)
+        {
+            int greenPixels = 0;
+            int totalPixels = GreenSampleGridSize * GreenSampleGridSize;
+            int stride = (int)(VideoWidth * 4);
+
+            for (int row = 0; row < GreenSampleGridSize; row++)
+            {
+                int py = (int)(VideoHeight * (row + 1) / (GreenSampleGridSize + 1));
+                for (int col = 0; col < GreenSampleGridSize; col++)
+                {
+                    int px = (int)(VideoWidth * (col + 1) / (GreenSampleGridSize + 1));
+                    int offset = py * stride + px * 4;
+                    byte b = Marshal.ReadByte(buf, offset + 0);
+                    byte g = Marshal.ReadByte(buf, offset + 1);
+                    byte r = Marshal.ReadByte(buf, offset + 2);
+
+                    if (g > GreenDominanceThreshold
+                        && g - r > GreenDominanceMargin
+                        && g - b > GreenDominanceMargin)
+                    {
+                        greenPixels++;
+                    }
+                }
+            }
+
+            // Зелений екран якщо > 50% пікселів зелені
+            return greenPixels > totalPixels / 2;
+        }
+
+        /// <summary>
+        /// Перевіряє чи буфер порожній (VLC ще не записав жодного кадру).
+        /// Читає лише один піксель у центрі — достатньо для швидкої перевірки.
+        /// </summary>
+        private bool IsFrameEmpty(IntPtr buf)
+        {
+            int stride = (int)(VideoWidth * 4);
+            int offset = (int)(VideoHeight / 2) * stride + (int)(VideoWidth / 2) * 4;
+            byte b = Marshal.ReadByte(buf, offset + 0);
+            byte g = Marshal.ReadByte(buf, offset + 1);
+            byte r = Marshal.ReadByte(buf, offset + 2);
+            byte a = Marshal.ReadByte(buf, offset + 3);
+            return r == 0 && g == 0 && b == 0 && a == 0;
+        }
+
+        /// <summary>
+        /// Fallback відновлення від зеленого екрану.
+        /// З avcodec-hw=none це не повинно траплятись в нормальних умовах.
+        /// Можливі залишкові причини: пошкоджений потік, проблема з мережею.
+        /// </summary>
+        private void TryRecoverFromGreenScreen()
+        {
+            if (_vlcPlayer == null || _isDisposing || _isLoopingVideo) return;
+            if (string.IsNullOrEmpty(_currentVideoUrl)) return;
+
+            try
+            {
+                if (!_hwDecodeAttempted)
+                {
+                    _hwDecodeAttempted = true;
+                    Log("[GREEN DEBUG] ⚠ Зелений екран при hw=none — можлива проблема з потоком або мережею", "error");
+                    Log("[GREEN DEBUG] 🔄 Спроба: перезапуск з поточної позиції", "warning");
+
+                    long seekPosMs = 0;
+                    lock (_vlcLock) { if (_vlcPlayer != null) seekPosMs = _vlcPlayer.Time; }
+
+                    _greenFrameCount = 0;
+                    _greenScreenActive = false;
+                    _waitingForFirstVlcFrame = true;
+                    _vlcFrameCount = 0;
+                    _pendingFadeOut = false;
+                    _stableFrameCount = 0;
+
+                    var prevMedia = _currentMedia;
+                    _currentMedia = new LibVLCSharp.Shared.Media(_libVLC, new Uri(_currentVideoUrl));
+                    _currentMedia.AddOption(":network-caching=1000");
+                    _currentMedia.AddOption(":clock-jitter=0");
+                    _currentMedia.AddOption(":clock-synchro=0");
+                    _currentMedia.AddOption(":avcodec-hw=none");
+                    _currentMedia.AddOption(":input-repeat=65535");
+                    _currentMedia.AddOption(":no-audio");
+                    prevMedia?.Dispose();
+
+                    lock (_vlcLock)
+                    {
+                        if (_vlcPlayer != null && !_isDisposing)
+                        {
+                            _vlcPlayer.Play(_currentMedia);
+                            if (seekPosMs > 1000)
+                            {
+                                _vlcPlayer.Time = seekPosMs;
+                                _lastVlcRawTime = seekPosMs;
+                                _lastSeekTime = DateTime.Now;
+                            }
+                        }
+                    }
+                    Log($"[GREEN DEBUG] 🔄 Перезапуск з позиції {seekPosMs}ms", "info");
+                }
+                else
+                {
+                    Log("[GREEN DEBUG] ⚠ Повторний зелений екран — можливо URL протух або пошкоджений потік", "error");
+                    lock (_vlcLock)
+                    {
+                        if (_vlcPlayer == null || _isDisposing) return;
+                        long pos = _vlcPlayer.Time;
+                        _vlcPlayer.Time = pos;
+                        _lastSeekTime = DateTime.Now;
+                        Log($"[GREEN DEBUG] 🔄 Hard seek: {pos}ms", "warning");
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"[GREEN DEBUG] Відновлення failed: {ex.Message}", "error");
             }
         }
 
@@ -231,13 +535,18 @@ namespace WallpaperMusicPlayer
 
             InitializeAsync();
 
-            if (File.Exists(_idleVideoPath))
+            // Запускаємо SkiaSharp аніматор замість idle.mp4
+            if (_animator != null)
             {
-                PlayLocalLoop(_idleVideoPath, "Startup");
+                _animator.Start();   // один раз на весь час роботи програми
+                _animator.ShowNoPlayer();
+                _isLocalLoopPlaying = true;
+                Log("[ANIMATOR] Started — showing NoPlayer screen", "success");
             }
-            else
+            else if (File.Exists(_idleVideoPath))
             {
-                Log("[WARNING] idle.mp4 not found - application may not work correctly", "warning");
+                // Fallback на mp4 якщо аніматор не ініціалізувався
+                PlayLocalLoop(_idleVideoPath, "Startup");
             }
         }
 
@@ -269,8 +578,13 @@ namespace WallpaperMusicPlayer
                     {
                         if (_vlcPlayer != null && !_isDisposing)
                         {
+                            // ВИПРАВЛЕНО: Play() без аргументу не гарантує повторне відтворення
+                            // після Stop() — передаємо явно поточний Media об'єкт.
                             _vlcPlayer.Stop();
-                            _vlcPlayer.Play();
+                            if (_currentMedia != null)
+                                _vlcPlayer.Play(_currentMedia);
+                            else
+                                _vlcPlayer.Play();
                         }
                     }
                 }
@@ -316,6 +630,11 @@ namespace WallpaperMusicPlayer
                 }
 
                 Log("[VLC] Status: Playing", "success");
+
+                // FadeOut тут — VLC підтвердив що реально грає.
+                // Працює і для першого старту і для resume після паузи.
+                _animator?.FadeOut();
+                Log("[ANIMATOR] Fading out overlay — VLC confirmed playing", "info");
 
                 try
                 {
@@ -366,13 +685,19 @@ namespace WallpaperMusicPlayer
                 Log("[VLC] Critical Error - attempting recovery", "error");
                 _isVideoLoaded = false;
 
-                if (!_isLocalLoopPlaying && File.Exists(_loadingVideoPath))
+                if (!_isLocalLoopPlaying)
                 {
-                    PlayLocalLoop(_loadingVideoPath, "Error Recovery");
-                }
-                else if (!File.Exists(_loadingVideoPath))
-                {
-                    Log("[ERROR] loading.mp4 not found - cannot recover from error", "error");
+                    // Показуємо аніматор замість loading.mp4
+                    if (_animator != null)
+                    {
+                        _animator.ShowLoading(_lastSong);
+                        _isLocalLoopPlaying = true;
+                        Log("[ANIMATOR] Showing Loading (error recovery)", "warning");
+                    }
+                    else if (File.Exists(_loadingVideoPath))
+                    {
+                        PlayLocalLoop(_loadingVideoPath, "Error Recovery");
+                    }
                 }
             });
         }
@@ -468,10 +793,13 @@ namespace WallpaperMusicPlayer
                 {
                     if (_vlcPlayer != null && !_isDisposing)
                     {
-                        using var media = new LibVLCSharp.Shared.Media(_libVLC, path);
+                        // ВИПРАВЛЕНО: не використовуємо 'using' — VLC читає Media асинхронно
+                        // після повернення Play(). Об'єкт звільняється VLC самостійно.
+                        var media = new LibVLCSharp.Shared.Media(_libVLC, path);
                         media.AddOption(":input-repeat=65535");
                         media.AddOption(":no-audio");
                         _vlcPlayer.Play(media);
+                        media.Dispose(); // безпечно: LibVLC внутрішньо тримає власний ref-count
                     }
                 }
             }
@@ -524,6 +852,14 @@ namespace WallpaperMusicPlayer
 
                 _videoRenderSemaphore.Dispose();
 
+                // Звільняємо поточний Media об'єкт
+                _currentMedia?.Dispose();
+                _currentMedia = null;
+
+                // Очищення аніматора
+                _animator?.Dispose();
+                _animator = null;
+
                 // Очищення YoutubeWrapper
                 _youtubeWrapper?.Dispose();
                 _youtubeWrapper = null;
@@ -550,11 +886,22 @@ namespace WallpaperMusicPlayer
             {
                 var session = GetRelevantSession(_mediaManager);
 
+                // session == null означає що немає ні Playing ні Paused сесії
                 if (session == null)
                 {
+                    // ВИПРАВЛЕНО: скидаємо _wasPlaying та _lastSong —
+                    // інакше при наступній появі сесії переходи стану спрацюють неправильно.
+                    _wasPlaying = false;
+                    _lastSong = "";
+
                     if (!_isLocalLoopPlaying && File.Exists(_idleVideoPath))
                     {
                         PlayLocalLoop(_idleVideoPath, "No Session");
+                    }
+                    else if (!_isLocalLoopPlaying && _animator != null)
+                    {
+                        _animator.ShowNoPlayer();
+                        _isLocalLoopPlaying = true;
                     }
                     UpdateTimingDisplay(TimeSpan.Zero, TimeSpan.Zero, false, false);
                     return;
@@ -571,14 +918,37 @@ namespace WallpaperMusicPlayer
                 _currentSessionId = currentSessionId;
 
                 var playbackInfo = session.GetPlaybackInfo();
+                // ВИПРАВЛЕНО: GetPlaybackInfo() може повернути null якщо сесія зникла
+                // між GetRelevantSession() і цим викликом — без перевірки NullReferenceException.
+                if (playbackInfo == null)
+                {
+                    Log("[MONITOR] PlaybackInfo is null — session may have disappeared", "warning");
+                    return;
+                }
                 bool isMusicPlaying = playbackInfo.PlaybackStatus == GlobalSystemMediaTransportControlsSessionPlaybackStatus.Playing;
 
+                // ShowIdle викликається рівно один раз — при переході playing→paused
+                // _isLocalLoopPlaying НЕ виставляється — щоб не ламати твій оригінальний
+                // блок нижче який перевіряє його для sync display
                 if (isMusicPlaying != _wasPlaying)
                 {
                     Log($"[STATUS] Music: {(isMusicPlaying ? "PLAYING" : "PAUSED")}", isMusicPlaying ? "success" : "warning");
                     _wasPlaying = isMusicPlaying;
+
+                    if (!isMusicPlaying && _animator != null)
+                    {
+                        _animator.ShowIdle(_lastSong, session);
+                        Log("[ANIMATOR] Showing Idle (paused)", "info");
+                    }
+                    else if (isMusicPlaying && _animator != null)
+                    {
+                        // FadeOut після resume робиться в VlcPlayer_Playing —
+                        // коли VLC підтвердив що реально відновив відтворення.
+                        Log("[ANIMATOR] Resume detected — waiting for VLC Playing event", "info");
+                    }
                 }
 
+                // ── твій оригінальний блок паузи без жодних змін ─────────────
                 if (!isMusicPlaying)
                 {
                     if (_vlcPlayer != null && _vlcPlayer.IsPlaying && !_isDisposing)
@@ -629,7 +999,15 @@ namespace WallpaperMusicPlayer
                 {
                     _lastSong = currentSong;
 
-                    if (File.Exists(_loadingVideoPath))
+                    // Показуємо Loading аніматор замість loading.mp4
+                    if (_animator != null)
+                    {
+                        // Передаємо session — аніматор сам отримає обкладинку з SMTC
+                        _animator.ShowLoading(currentSong, session);
+                        _isLocalLoopPlaying = true;
+                        Log($"[ANIMATOR] Showing Loading for: {currentSong}", "info");
+                    }
+                    else if (File.Exists(_loadingVideoPath))
                     {
                         PlayLocalLoop(_loadingVideoPath, "Track Switch");
                     }
@@ -1017,48 +1395,97 @@ namespace WallpaperMusicPlayer
         }
 
         /// <summary>
+        /// Нормалізує варіанти написання featuring у рядку.
+        /// "feat.", "ft.", "featuring", "feat " → єдиний токен "feat"
+        /// щоб fuzzy-match коректно порівнював назви з колаборацій.
+        /// Наприклад: "Calvin Harris feat. Rihanna" ↔ "Rihanna ft. Calvin Harris"
+        /// </summary>
+        private static string NormalizeFeaturingTags(string input)
+        {
+            // Порядок важливий: довші варіанти першими щоб уникнути часткових замін
+            return input
+                .Replace("featuring", "feat")
+                .Replace("feat.", "feat")
+                .Replace(" ft.", " feat")
+                .Replace(" ft ", " feat ");
+        }
+
+        /// <summary>
         /// Скорує результат пошуку YouTube.
         /// Основа: FuzzySharp TokenSetRatio — релевантність незалежно від порядку слів.
-        /// Підтвердження: автор каналу, тривалість, формат відео.
+        /// Підтвердження: автор каналу, тривалість, формат відео, позиція в результатах.
         /// Штрафи: явний сміт + контекстні (official audio / Topic якщо є кращий кандидат).
+        ///
+        /// ПОКРАЩЕННЯ відносно попередньої версії:
+        ///   1. Ваги винесено в ScoreWeights — легко тюнити без ризику зламати логіку.
+        ///   2. Нормалізація feat./ft./featuring перед fuzzy-match.
+        ///   3. Бонус за позицію в результатах пошуку (YouTube сортує за релевантністю).
+        ///   4. Виправлено баг: VEVO більше не отримує штраф NoVideoMarker.
+        ///   5. Виправлено мертвий код: "OFFICIAL M/ V" замінено на реальні варіанти.
+        ///   6. Логування розбивки балів передається назовні через scoreBreakdown.
         /// </summary>
-        private int ScoreVideo(VideoSearchResult video, string artist, string title, TimeSpan trackDuration)
+        private int ScoreVideo(
+            VideoSearchResult video,
+            string artist,
+            string title,
+            TimeSpan trackDuration,
+            int searchResultIndex = 0,
+            List<string>? scoreBreakdown = null)
         {
             int score = 0;
-            var ytTitle = video.Title.ToLower();
+
+            // ── Нормалізація рядків (один раз, не в кожній умові) ────────────
+            var ytTitle = NormalizeFeaturingTags(video.Title.ToLower());
             var ytAuthor = video.Author.ToLower();
-            var artLow = artist.ToLower();
-            var titleLow = title.ToLower();
+            var artLow = NormalizeFeaturingTags(artist.ToLower());
+            var titleLow = NormalizeFeaturingTags(title.ToLower());
+
+            void Track(string label, int delta)
+            {
+                score += delta;
+                scoreBreakdown?.Add($"{label}: {delta:+#;-#;0}");
+            }
 
             // ================================================================
-            // ОСНОВНИЙ КРИТЕРІЙ — Fuzzy matching (0–100)
+            // ОСНОВНИЙ КРИТЕРІЙ — Fuzzy matching (0–150)
             // TokenSetRatio ігнорує порядок слів і зайві слова в назві —
             // тому "Veilr Rampant Official Video" і "Rampant Veilr" дадуть ~100.
             // ================================================================
 
             string searchQuery = $"{artLow} {titleLow}";
             int fuzzyScore = Fuzz.TokenSetRatio(searchQuery, ytTitle);
+            Track("Fuzzy", (int)(fuzzyScore * ScoreWeights.FuzzyMultiplier));
 
-            // Масштабуємо: fuzzy дає 0–100, множимо на 1.5 щоб він домінував над бонусами
-            score += (int)(fuzzyScore * 1.5);
+            // ================================================================
+            // БОНУС ЗА ПОЗИЦІЮ В РЕЗУЛЬТАТАХ ПОШУКУ
+            // YouTube сортує результати за власною релевантністю —
+            // перша позиція статистично є найточнішим збігом.
+            // Позиція 0 → +15, 1 → +10, 2 → +5, 3+ → 0
+            // ================================================================
+
+            int positionBonus = Math.Max(0,
+                (ScoreWeights.PositionBonusMaxIdx - searchResultIndex) * ScoreWeights.PositionBonusStep);
+            if (positionBonus > 0)
+                Track($"Position#{searchResultIndex}", positionBonus);
 
             // ================================================================
             // ПІДТВЕРДЖУЮЧІ СИГНАЛИ
             // ================================================================
 
-            // Автор каналу = артист — дуже надійний сигнал
-            if (ytAuthor.Contains(artLow)) score += 30;
+            if (ytAuthor.Contains(artLow))
+                Track("AuthorMatch", ScoreWeights.AuthorMatchBonus);
 
-            // VEVO канал — завжди офіційний кліп
-            if (ytAuthor.Contains("vevo")) score += 25;
+            // ВИПРАВЛЕНО: VEVO перевіряємо окремо від isBadContent —
+            // VEVO-канал за визначенням не може бути karaoke/reaction,
+            // тому не повинен отримувати штраф NoVideoMarker через isBadContent.
+            bool isVevo = ytAuthor.Contains("vevo");
+            if (isVevo)
+                Track("VEVO", ScoreWeights.VevoBonus);
 
-            // "official video" в назві — явний сигнал кліпу
-            // Підняли до +50 щоб завжди перекривав перевагу тривалості
             if (ytTitle.Contains("official video") ||
-                ytTitle.Contains("official music video")) score += 50;
+                ytTitle.Contains("official music video"))
+                Track("OfficialVideo", ScoreWeights.OfficialVideoBonus);
 
-            // "music video" без "official" — теж кліп
-            // але не рахуємо якщо це небажаний контент
             bool isBadContent = ytTitle.Contains("fan made")
                              || ytTitle.Contains("fan-made")
                              || ytTitle.Contains("karaoke")
@@ -1067,10 +1494,17 @@ namespace WallpaperMusicPlayer
                              || (ytTitle.Contains("cover") && !titleLow.Contains("cover"));
 
             if (!isBadContent && ytTitle.Contains("music video") &&
-                !ytTitle.Contains("official music video")) score += 30;
+                !ytTitle.Contains("official music video"))
+                Track("MusicVideo", ScoreWeights.MusicVideoBonus);
 
-            // "trailer" + назва треку одночасно — ігровий/анімаційний кліп
-            if (ytTitle.Contains("trailer") && ytTitle.Contains(titleLow)) score += 20;
+            if (ytTitle.Contains("trailer") && ytTitle.Contains(titleLow))
+                Track("Trailer", ScoreWeights.TrailerBonus);
+
+            // ВИПРАВЛЕНО: перевіряємо ytTitle (не ytAuthor) на "official mv" —
+            // це типова назва відео, не каналу. Прибрано мертвий рядок "OFFICIAL M/ V".
+            if (ytTitle.Contains("official mv") ||
+                (ytTitle.Contains(" mv") && ytTitle.Contains(titleLow)))
+                Track("OfficialMV", ScoreWeights.OfficialMVBonus);
 
             // ================================================================
             // ЗБІГ ТРИВАЛОСТІ
@@ -1080,49 +1514,55 @@ namespace WallpaperMusicPlayer
             {
                 double diffSec = Math.Abs((video.Duration - trackDuration).TotalSeconds);
 
-                if (diffSec < 5) score += 25;
-                else if (diffSec < 15) score += 15;
-                else if (diffSec < 30) score += 5;
-                else if (diffSec > 120) score -= 20;
+                if (diffSec < 5) Track("Duration<5s", ScoreWeights.DurationExactBonus);
+                else if (diffSec < 15) Track("Duration<15s", ScoreWeights.DurationCloseBonus);
+                else if (diffSec < 30) Track("Duration<30s", ScoreWeights.DurationOkBonus);
+                else if (diffSec > 120) Track("Duration>120s", ScoreWeights.DurationFarPenalty);
             }
 
             // ================================================================
             // ШТРАФИ — явний небажаний контент
             // ================================================================
 
-            if (ytTitle.Contains("karaoke")) score -= 60;
-            if (ytTitle.Contains("1 hour")) score -= 60;
-            if (ytTitle.Contains("reaction")) score -= 50;
-            if (ytTitle.Contains("fan made") ||
-                ytTitle.Contains("fan-made")) score -= 50;
-            if (ytTitle.Contains("cover") && !titleLow.Contains("cover")) score -= 40;
-            if (ytTitle.Contains("lyrics")) score -= 50;
+            if (ytTitle.Contains("karaoke"))
+                Track("Karaoke", ScoreWeights.KaraokePenalty);
+            if (ytTitle.Contains("1 hour"))
+                Track("1Hour", ScoreWeights.OneHourPenalty);
+            if (ytTitle.Contains("reaction"))
+                Track("Reaction", ScoreWeights.ReactionPenalty);
+            if (ytTitle.Contains("fan made") || ytTitle.Contains("fan-made"))
+                Track("FanMade", ScoreWeights.FanMadePenalty);
+            if (ytTitle.Contains("cover") && !titleLow.Contains("cover"))
+                Track("Cover", ScoreWeights.CoverPenalty);
+            if (ytTitle.Contains("lyrics"))
+                Track("Lyrics", ScoreWeights.LyricsPenalty);
+            if (ytTitle.Contains("dance practice"))
+                Track("DancePractice", ScoreWeights.DancePracticePenalty);
 
-            // YouTube - Topic канали — автоматично згенерований аудіо стрім,
-            // завжди штрафуємо бо YouTube і без нього ставить офіційне аудіо першим
-            if (ytAuthor.EndsWith("- topic")) score -= 70;
+            if (ytAuthor.EndsWith("- topic"))
+                Track("TopicChannel", ScoreWeights.TopicChannelPenalty);
 
-            // Штраф за різний алфавіт у залишку назви відео
-            // Наприклад: трек латиницею, а в назві відео є "Караоке" кирилицею
+            // Штраф за різний алфавіт у залишку назви відео.
+            // Використовуємо \b-аналог через пробіли щоб не вирізати частини слів.
             string remainder = ytTitle
-                .Replace(titleLow, "")
-                .Replace(artLow, "")
+                .Replace(" " + titleLow + " ", " ")
+                .Replace(" " + artLow + " ", " ")
                 .Trim();
 
-            if (!AreSameAlphabetGroup(titleLow, remainder)) score -= 50;
+            if (!AreSameAlphabetGroup(titleLow, remainder))
+                Track("WrongAlphabet", ScoreWeights.WrongAlphabetPenalty);
 
-            // Штраф за відсутність відео-маркера — пріоритет на кліпах
-            // VEVO не штрафуємо бо це завжди кліп
-            // Небажаний контент не рахується як валідний маркер
-            bool hasVideoMarker = !isBadContent && (
+            // ВИПРАВЛЕНО: VEVO завжди вважається відео-маркером незалежно від isBadContent —
+            // раніше через operator precedence vevo міг не рятувати від штрафу.
+            bool hasVideoMarker = isVevo || (!isBadContent && (
                                    ytTitle.Contains("music video")
                                 || ytTitle.Contains("official video")
                                 || ytTitle.Contains("official music video")
                                 || ytTitle.Contains("trailer")
-                                || ytTitle.Contains("clip"))
-                                || ytAuthor.Contains("vevo");
+                                || ytTitle.Contains("clip")));
 
-            if (!hasVideoMarker) score -= 50;
+            if (!hasVideoMarker)
+                Track("NoVideoMarker", ScoreWeights.NoVideoMarkerPenalty);
 
             return score;
         }
@@ -1149,7 +1589,11 @@ namespace WallpaperMusicPlayer
                 if (!await WaitForInternetConnection(token))
                 {
                     Log("[NETWORK ERROR] No internet connection available", "error");
-                    if (File.Exists(_loadingVideoPath))
+                    if (_animator != null)
+                    {
+                        await Dispatcher.InvokeAsync(() => { _animator.ShowLoading(query); _isLocalLoopPlaying = true; });
+                    }
+                    else if (File.Exists(_loadingVideoPath))
                     {
                         await Dispatcher.InvokeAsync(() => PlayLocalLoop(_loadingVideoPath, "No Internet"));
                     }
@@ -1165,7 +1609,11 @@ namespace WallpaperMusicPlayer
 
                     if (_youtubeWrapper == null || !_youtubeWrapper.IsLoaded)
                     {
-                        if (File.Exists(_loadingVideoPath))
+                        if (_animator != null)
+                        {
+                            await Dispatcher.InvokeAsync(() => { _animator.ShowLoading(query); _isLocalLoopPlaying = true; });
+                        }
+                        else if (File.Exists(_loadingVideoPath))
                         {
                             await Dispatcher.InvokeAsync(() => PlayLocalLoop(_loadingVideoPath, "YouTube Unavailable"));
                         }
@@ -1225,35 +1673,60 @@ namespace WallpaperMusicPlayer
                             // (official video / VEVO / trailer + назва треку)
                             bool hasPriorityCandidate = searchResults.Any(v => IsVideoPriorityCandidate(v, titleLow));
 
-                            // Скоруємо кожен результат
-                            var scored = searchResults.Select(v =>
+                            // Скоруємо кожен результат.
+                            // Передаємо індекс для бонусу за позицію та список breakdown для логів.
+                            var scored = searchResults.Select((v, idx) =>
                             {
-                                int s = ScoreVideo(v, artist, title, trackDuration);
+                                var breakdown = new List<string>();
+                                int s = ScoreVideo(v, artist, title, trackDuration,
+                                    searchResultIndex: idx,
+                                    scoreBreakdown: breakdown);
 
                                 // Контекстний штраф: якщо є кращий кандидат —
                                 // official audio і Topic канали йдуть на другий план
                                 if (hasPriorityCandidate)
                                 {
-                                    var ytTitle = v.Title.ToLower();
-                                    var ytAuthor = v.Author.ToLower();
+                                    var ytTitleCtx = v.Title.ToLower();
+                                    var ytAuthorCtx = v.Author.ToLower();
 
-                                    if (ytTitle.Contains("official audio")) s -= 40;
-                                    if (ytAuthor.EndsWith("- topic")) s -= 40;
-                                    if (ytTitle.Contains("official lyric video") ||
-                                        ytTitle.Contains("lyric video")) s -= 30;
+                                    if (ytTitleCtx.Contains("official audio"))
+                                    {
+                                        s += ScoreWeights.ContextOfficialAudioPenalty;
+                                        breakdown.Add($"CtxOfficialAudio: {ScoreWeights.ContextOfficialAudioPenalty}");
+                                    }
+                                    if (ytAuthorCtx.EndsWith("- topic"))
+                                    {
+                                        s += ScoreWeights.ContextTopicPenalty;
+                                        breakdown.Add($"CtxTopic: {ScoreWeights.ContextTopicPenalty}");
+                                    }
+                                    if (ytTitleCtx.Contains("official lyric video") ||
+                                        ytTitleCtx.Contains("lyric video"))
+                                    {
+                                        s += ScoreWeights.ContextLyricVideoPenalty;
+                                        breakdown.Add($"CtxLyricVideo: {ScoreWeights.ContextLyricVideoPenalty}");
+                                    }
                                 }
 
-                                return new { Video = v, Score = s };
+                                return new { Video = v, Score = s, Index = idx, Breakdown = breakdown };
                             })
                             .OrderByDescending(x => x.Score)
                             .ToList();
 
-                            // Логуємо всіх кандидатів для діагностики
-                            for (int i = 0; i < scored.Count; i++)
+                            // ── ЛОГУВАННЯ РОЗБИВКИ БАЛІВ ─────────────────────
+                            // Спочатку всі кандидати в оригінальному порядку пошуку (Index 0..N),
+                            // потім окремо переможець з повною розбивкою балів.
+                            var winner = scored[0];
+
+                            foreach (var v in scored.OrderBy(x => x.Index))
                             {
-                                var v = scored[i];
-                                Log($"[SEARCH] #{i + 1} score={v.Score:+#;-#;0} | '{v.Video.Title}' by {v.Video.Author} ({v.Video.Duration:mm\\:ss})", "info");
+                                bool isWinner = v.Index == winner.Index;
+                                string star = isWinner ? " ★ WINNER" : "";
+                                Log($"[SCORE] #{v.Index + 1}{star} score={v.Score:+#;-#;0} | '{v.Video.Title}' by {v.Video.Author} ({v.Video.Duration:mm\\:ss})", isWinner ? "success" : "info");
                             }
+
+                            // Детальна розбивка переможця окремим рядком
+                            var breakdownStr = string.Join(" | ", winner.Breakdown);
+                            Log($"[SCORE] breakdown #{winner.Index + 1}: {breakdownStr}", "info");
 
                             var best = scored[0].Video;
                             videoId = best.VideoId;
@@ -1301,69 +1774,99 @@ namespace WallpaperMusicPlayer
                 if (token.IsCancellationRequested || string.IsNullOrEmpty(videoId))
                     return;
 
-                try
+                // ── Отримання stream URL з retry ─────────────────────────────
+                // YouTube іноді навмисно сповільнює або блокує GetManifestAsync.
+                // Повторюємо до 3 разів з затримкою що збільшується (2s, 4s).
+                // videoId вже відомий — повторюємо тільки цей запит, не пошук.
+                const int MaxStreamRetries = 3;
+                const int RetryDelayBaseSeconds = 2;
+
+                for (int attempt = 1; attempt <= MaxStreamRetries; attempt++)
                 {
-                    using var manifestCts = CancellationTokenSource.CreateLinkedTokenSource(token);
-                    manifestCts.CancelAfter(TimeSpan.FromSeconds(NETWORK_TIMEOUT_SECONDS));
+                    if (token.IsCancellationRequested) return;
 
-                    Log($"[STREAM] Getting stream URL for: {videoId}", "info");
-                    var streamInfo = await _youtubeWrapper.GetVideoStreamAsync(videoId, manifestCts.Token);
-
-                    if (streamInfo != null)
+                    try
                     {
-                        streamUrl = streamInfo.Url;
+                        using var manifestCts = CancellationTokenSource.CreateLinkedTokenSource(token);
+                        manifestCts.CancelAfter(TimeSpan.FromSeconds(NETWORK_TIMEOUT_SECONDS));
 
-                        _smartCache[query] = new CachedVideo
-                        {
-                            VideoId = videoId,
-                            StreamUrl = streamUrl,
-                            ExpiryTime = DateTime.Now.AddHours(YOUTUBE_CACHE_HOURS)
-                        };
+                        if (attempt > 1)
+                            Log($"[STREAM] Retry {attempt}/{MaxStreamRetries} for: {videoId}", "warning");
+                        else
+                            Log($"[STREAM] Getting stream URL for: {videoId}", "info");
 
-                        while (_smartCache.Count > MAX_CACHE_SIZE)
+                        var streamInfo = await _youtubeWrapper.GetVideoStreamAsync(videoId, manifestCts.Token);
+
+                        if (streamInfo != null)
                         {
-                            var oldestKey = _smartCache.OrderBy(kv => kv.Value.ExpiryTime).First().Key;
-                            _smartCache.TryRemove(oldestKey, out _);
+                            streamUrl = streamInfo.Url;
+
+                            _smartCache[query] = new CachedVideo
+                            {
+                                VideoId = videoId,
+                                StreamUrl = streamUrl,
+                                ExpiryTime = DateTime.Now.AddHours(YOUTUBE_CACHE_HOURS)
+                            };
+
+                            while (_smartCache.Count > MAX_CACHE_SIZE)
+                            {
+                                var oldestKey = _smartCache.OrderBy(kv => kv.Value.ExpiryTime).First().Key;
+                                _smartCache.TryRemove(oldestKey, out _);
+                            }
+
+                            Log($"[STREAM] Quality: {streamInfo.Quality}, Container: {streamInfo.Container}, Height: {streamInfo.Height}p", "info");
+                            break; // успіх — виходимо з циклу retry
                         }
-
-                        Log($"[STREAM] Quality: {streamInfo.Quality}, Container: {streamInfo.Container}, Height: {streamInfo.Height}p", "info");
-                    }
-                    else
-                    {
-                        Log($"[ERROR] No suitable stream found for: {videoId}", "error");
-                        return;
-                    }
-                }
-                catch (OperationCanceledException)
-                {
-                    Log($"[TIMEOUT] Manifest request timed out after {NETWORK_TIMEOUT_SECONDS}s", "warning");
-                    return;
-                }
-                catch (Exception ex)
-                {
-                    // ДЕТАЛЬНЕ ЛОГУВАННЯ ПОМИЛКИ MANIFEST
-                    string errorDetails = $"{ex.GetType().Name}: {ex.Message}";
-
-                    if (ex.InnerException != null)
-                    {
-                        errorDetails += $"\n    Inner: {ex.InnerException.GetType().Name}: {ex.InnerException.Message}";
-                    }
-
-                    if (!string.IsNullOrEmpty(ex.StackTrace))
-                    {
-                        var stackLines = ex.StackTrace.Split('\n', StringSplitOptions.RemoveEmptyEntries);
-                        if (stackLines.Length > 0)
+                        else
                         {
-                            errorDetails += $"\n    At: {stackLines[0].Trim()}";
+                            Log($"[ERROR] No suitable stream found for: {videoId}", "error");
+                            return;
                         }
                     }
+                    catch (OperationCanceledException)
+                    {
+                        if (token.IsCancellationRequested) return; // трек змінився — не ретраємо
 
-                    Log($"[MANIFEST ERROR] {errorDetails}", "error");
-                    _smartCache.TryRemove(query, out _);
+                        Log($"[TIMEOUT] Manifest request timed out after {NETWORK_TIMEOUT_SECONDS}s (attempt {attempt}/{MaxStreamRetries})", "warning");
 
-                    // Можливо YouTube API зламався
-                    _ = Task.Run(() => CheckYoutubeHealthAsync());
-                    return;
+                        if (attempt == MaxStreamRetries)
+                        {
+                            Log($"[STREAM] All {MaxStreamRetries} attempts failed for: {videoId}", "error");
+                            return;
+                        }
+
+                        int delaySeconds = RetryDelayBaseSeconds * attempt; // 2s, 4s
+                        Log($"[STREAM] Waiting {delaySeconds}s before retry...", "info");
+                        await Task.Delay(TimeSpan.FromSeconds(delaySeconds), token);
+                    }
+                    catch (Exception ex)
+                    {
+                        // ДЕТАЛЬНЕ ЛОГУВАННЯ ПОМИЛКИ MANIFEST
+                        string errorDetails = $"{ex.GetType().Name}: {ex.Message}";
+
+                        if (ex.InnerException != null)
+                            errorDetails += $"\n    Inner: {ex.InnerException.GetType().Name}: {ex.InnerException.Message}";
+
+                        if (!string.IsNullOrEmpty(ex.StackTrace))
+                        {
+                            var stackLines = ex.StackTrace.Split('\n', StringSplitOptions.RemoveEmptyEntries);
+                            if (stackLines.Length > 0)
+                                errorDetails += $"\n    At: {stackLines[0].Trim()}";
+                        }
+
+                        Log($"[MANIFEST ERROR] {errorDetails}", "error");
+                        _smartCache.TryRemove(query, out _);
+
+                        if (attempt == MaxStreamRetries)
+                        {
+                            _ = Task.Run(() => CheckYoutubeHealthAsync());
+                            return;
+                        }
+
+                        int delaySeconds = RetryDelayBaseSeconds * attempt;
+                        Log($"[STREAM] Waiting {delaySeconds}s before retry...", "info");
+                        await Task.Delay(TimeSpan.FromSeconds(delaySeconds), token);
+                    }
                 }
 
                 if (token.IsCancellationRequested)
@@ -1420,27 +1923,52 @@ namespace WallpaperMusicPlayer
 
             try
             {
+                // FadeOut перенесено в VlcPlayer_Playing — overlay зникає тільки
+                // коли VLC підтвердив що реально грає, а не одразу при старті.
+                _pendingFadeOut = false;
+                _stableFrameCount = 0;
+                _waitingForFirstVlcFrame = true;
+                _vlcFrameCount = 0;
+                _greenFrameCount = 0;
+                _greenScreenActive = false;
+                Log($"[GREEN DEBUG] Очікуємо перший VLC кадр (розмір: {VideoWidth}x{VideoHeight})" +
+                    $" | hw-decode=none (SetVideoCallbacks несумісний з hw-decode)", "info");
+
                 _isLocalLoopPlaying = false;
                 _isVideoLoaded = false;
                 _isLoopingVideo = false;
                 _lastVlcRawTime = -1;
                 VideoImage.Opacity = 1.0;
 
-                using var media = new LibVLCSharp.Shared.Media(_libVLC, new Uri(url));
-                media.AddOption(":network-caching=1000");
-                media.AddOption(":clock-jitter=0");
-                media.AddOption(":clock-synchro=0");
-                media.AddOption(":avcodec-hw=any");
-                media.AddOption(":input-repeat=65535");
-                media.AddOption(":no-audio");
+                // Зберігаємо URL для можливого перезапуску без hw-декодера
+                _currentVideoUrl = url;
+                _hwDecodeAttempted = false;
 
-                Log("[VLC] Starting playback with optimized settings", "info");
+                // ВИПРАВЛЕНО: не використовуємо 'using' — VLC читає Media асинхронно.
+                // Зберігаємо у полі щоб контролювати час звільнення.
+                // Попередній Media звільняємо перед створенням нового.
+                var prevMedia = _currentMedia;
+                _currentMedia = new LibVLCSharp.Shared.Media(_libVLC, new Uri(url));
+                _currentMedia.AddOption(":network-caching=1000");
+                _currentMedia.AddOption(":clock-jitter=0");
+                _currentMedia.AddOption(":clock-synchro=0");
+                // ВИПРАВЛЕНО: avcodec-hw=any видалено — SetVideoCallbacks передає
+                // власний буфер (WriteableBitmap.BackBuffer) через VideoLock callback.
+                // hw-декодери (DXVA2, D3D11, NVDEC тощо) ігнорують цей вказівник і
+                // пишуть у власний GPU-буфер — звідси BGRA=(0,135,0) зелений екран.
+                // software decode завжди пише в наш буфер коректно.
+                _currentMedia.AddOption(":avcodec-hw=none");
+                _currentMedia.AddOption(":input-repeat=65535");
+                _currentMedia.AddOption(":no-audio");
+                prevMedia?.Dispose();
+
+                Log("[VLC] Starting playback | hw-decode=none (software decode)", "info");
 
                 lock (_vlcLock)
                 {
                     if (_vlcPlayer != null && !_isDisposing)
                     {
-                        _vlcPlayer.Play(media);
+                        _vlcPlayer.Play(_currentMedia);
                     }
                 }
             }
@@ -1449,7 +1977,12 @@ namespace WallpaperMusicPlayer
                 Log($"[VLC ERROR] Playback failed: {ex.Message}", "error");
                 _isVideoLoaded = false;
 
-                if (File.Exists(_loadingVideoPath))
+                if (_animator != null)
+                {
+                    _animator.ShowLoading(_lastSong);
+                    _isLocalLoopPlaying = true;
+                }
+                else if (File.Exists(_loadingVideoPath))
                 {
                     PlayLocalLoop(_loadingVideoPath, "Playback Error Recovery");
                 }

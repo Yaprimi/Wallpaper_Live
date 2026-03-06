@@ -14,14 +14,25 @@
             <ColumnDefinition Width="Auto"/>
         </Grid.ColumnDefinitions>
 
-        <!-- ВІДЕО (ОДНЕ ВІКНО) -->
-        <Image x:Name="VideoImage" 
+        <!-- ── ШАРО 1: VLC відео ───────────────────────────────────────── -->
+        <Image x:Name="VideoImage"
                Grid.Column="0"
-               Stretch="UniformToFill" 
-               HorizontalAlignment="Stretch" 
+               Stretch="UniformToFill"
+               HorizontalAlignment="Stretch"
                VerticalAlignment="Stretch"/>
 
-        <!-- ПАНЕЛЬ ВІДЛАДКИ (F12) -->
+        <!-- ── ШАРО 2: SkiaSharp overlay (idle / loading / no-player) ──── -->
+        <!-- Живе ПОВЕРХ VLC. Керується через Opacity (0=прозорий, 1=видимий). -->
+        <!-- VLC продовжує рендерити у свій буфер незалежно.                  -->
+        <Image x:Name="AnimatorImage"
+               Grid.Column="0"
+               Stretch="UniformToFill"
+               HorizontalAlignment="Stretch"
+               VerticalAlignment="Stretch"
+               Opacity="1"
+               IsHitTestVisible="False"/>
+
+        <!-- ── ПАНЕЛЬ ВІДЛАДКИ (F12) ────────────────────────────────────── -->
         <Grid x:Name="DebugPanel" Grid.Column="1" Background="#E6111111" Width="400" Visibility="Collapsed">
 
             <Grid.RowDefinitions>

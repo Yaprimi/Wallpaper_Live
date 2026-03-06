@@ -67,6 +67,10 @@ Wallpaper Live - Music Video Player
 
 		<!-- Fuzzy string matching для розумного пошуку відео -->
 		<PackageReference Include="FuzzySharp" Version="2.0.2" />
+
+		<PackageReference Include="SkiaSharp" Version="3.119.2" />
+		<PackageReference Include="SkiaSharp.Views.WPF" Version="3.119.2" />
+
 	</ItemGroup>
 
 	<ItemGroup>
@@ -87,10 +91,11 @@ Wallpaper Live - Music Video Player
 	<!-- Копіювання VLC нативних бібліотек в output директорію -->
 	<Target Name="CopyVLCLibraries" AfterTargets="Build">
 		<ItemGroup>
-			<!-- Знаходимо VLC DLL файли з NuGet пакету -->
-			<VLCFiles Include="$(NuGetPackageRoot)videolan.libvlc.windows\3.0.21\build\**\*.*" />
+			<!-- ВИПРАВЛЕНО: версія змінена з 3.0.21 на 3.0.23 —
+			     раніше шлях не існував (Condition завжди false) і DLL не копіювались. -->
+			<VLCFiles Include="$(NuGetPackageRoot)videolan.libvlc.windows\3.0.23\build\**\*.*" />
 		</ItemGroup>
-		<Copy SourceFiles="@(VLCFiles)" DestinationFolder="$(OutDir)libvlc\%(RecursiveDir)" SkipUnchangedFiles="true" Condition="Exists('$(NuGetPackageRoot)videolan.libvlc.windows\3.0.21\build')" />
+		<Copy SourceFiles="@(VLCFiles)" DestinationFolder="$(OutDir)libvlc\%(RecursiveDir)" SkipUnchangedFiles="true" Condition="Exists('$(NuGetPackageRoot)videolan.libvlc.windows\3.0.23\build')" />
 		<Message Text="VLC libraries copied to output directory" Importance="high" />
 	</Target>
 

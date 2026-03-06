@@ -177,6 +177,9 @@ namespace WallpaperMusicPlayer
         /// </summary>
         public void UnloadYoutubeExplode()
         {
+            // ВИПРАВЛЕНО: GC.Collect, GC.WaitForPendingFinalizers та Thread.Sleep
+            // винесені за межі lock — раніше вони блокували _lock на ~1.5 с,
+            // фризячи будь-який паралельний виклик SearchVideosAsync/GetVideoStreamAsync.
             lock (_lock)
             {
                 _youtubeClient = null;
@@ -187,17 +190,17 @@ namespace WallpaperMusicPlayer
                     _loadContext.Unload();
                     _loadContext = null;
                 }
-
-                // Примусова очистка пам'яті
-                for (int i = 0; i < 3; i++)
-                {
-                    GC.Collect();
-                    GC.WaitForPendingFinalizers();
-                }
-
-                // Чекаємо щоб файл точно вивантажився
-                Thread.Sleep(500);
             }
+
+            // Примусова очистка пам'яті — поза локом, не блокує інші потоки
+            for (int i = 0; i < 3; i++)
+            {
+                GC.Collect();
+                GC.WaitForPendingFinalizers();
+            }
+
+            // Чекаємо щоб файл точно вивантажився — поза локом
+            Thread.Sleep(500);
         }
 
         /// <summary>
@@ -810,11 +813,16 @@ namespace WallpaperMusicPlayer
         /// </summary>
         public async Task<bool> TestConnectionAsync()
         {
+            // ВИПРАВЛЕНО: обидва CancellationTokenSource тепер звільняються через using —
+            // раніше вони витікали (кожен утримує kernel handle таймера ОС).
             try
             {
                 // Крок 1: пошук відео
-                var cts = new CancellationTokenSource(15000);
-                var searchResults = await SearchVideosAsync("test", 1, cts.Token);
+                List<VideoSearchResult> searchResults;
+                using (var cts = new CancellationTokenSource(15000))
+                {
+                    searchResults = await SearchVideosAsync("test", 1, cts.Token);
+                }
 
                 if (searchResults.Count == 0)
                 {
@@ -825,7 +833,11 @@ namespace WallpaperMusicPlayer
                 // Крок 2: отримання stream URL — саме тут YouTube повертає 403
                 // якщо API зламано, хоча пошук ще працює
                 var videoId = searchResults[0].VideoId;
-                var streamInfo = await GetVideoStreamAsync(videoId, new CancellationTokenSource(15000).Token);
+                VideoStreamInfo? streamInfo;
+                using (var cts2 = new CancellationTokenSource(15000))
+                {
+                    streamInfo = await GetVideoStreamAsync(videoId, cts2.Token);
+                }
 
                 return streamInfo != null && !string.IsNullOrEmpty(streamInfo.Url);
             }

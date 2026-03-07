@@ -100,7 +100,7 @@ namespace WallpaperMusicPlayer
             _overlayImage.Source = _overlayBitmap;
             _overlayImage.Opacity = 1.0;
 
-            _timer = new DispatcherTimer(DispatcherPriority.Render)
+            _timer = new DispatcherTimer(DispatcherPriority.Normal)
             {
                 Interval = TimeSpan.FromMilliseconds(1000.0 / 60.0)
             };

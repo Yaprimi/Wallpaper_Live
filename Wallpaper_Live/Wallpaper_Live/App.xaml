@@ -1,7 +1,7 @@
-﻿<Application x:Class="Wallpaper_Live.App"
+﻿<Application x:Class="WallpaperMusicPlayer.App"
              xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
              xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-             xmlns:local="clr-namespace:Wallpaper_Live"
+             xmlns:local="clr-namespace:WallpaperMusicPlayer"
              StartupUri="MainWindow.xaml">
     <Application.Resources>
          

@@ -24,7 +24,7 @@ Wallpaper Live - Music Video Player
 		<UseRidGraph>true</UseRidGraph>
 
 		<!-- Точка входу -->
-		<StartupObject>Wallpaper_Live.App</StartupObject>
+		<StartupObject>WallpaperMusicPlayer.App</StartupObject>
 
 		<!-- Self-Contained Deployment для portable запуску -->
 		<SelfContained>true</SelfContained>
@@ -52,7 +52,6 @@ Wallpaper Live - Music Video Player
 
 		<!-- LibVLCSharp - відеоплеєр -->
 		<PackageReference Include="LibVLCSharp" Version="3.9.6" />
-		<PackageReference Include="LibVLCSharp.WPF" Version="3.9.6" />
 
 		<!-- VLC нативні бібліотеки для Windows -->
 		<PackageReference Include="VideoLAN.LibVLC.Windows" Version="3.0.23" />
